@@ -9,6 +9,7 @@ command for an example run:
 
 import math
 import timeit
+import pickle
 
 import os
 import os.path as osp
@@ -35,6 +36,8 @@ from modules.neighbor_loader import LastNeighborLoader
 from modules.memory_module import TGNMemory
 from modules.early_stopping import  EarlyStopMonitor
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
+from tqdm import tqdm
+from typing import Dict
 
 
 # ==========
@@ -61,20 +64,31 @@ def train():
     neighbor_loader.reset_state()  # Start with an empty graph.
 
     total_loss = 0
-    for batch in train_loader:
+
+    popularity = torch.zeros(data.num_nodes)
+
+    for batch in tqdm(train_loader, desc="Training", total=len(train_loader)):
         batch = batch.to(device)
         optimizer.zero_grad()
 
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
 
-        # Sample negative destination nodes.
-        neg_dst = torch.randint(
-            min_dst_idx,
-            max_dst_idx + 1,
-            (src.size(0),),
-            dtype=torch.long,
-            device=device,
-        )
+        if SAMPLING_STRATEGY == "naive":
+            # Sample negative destination nodes.
+            neg_dst = torch.randint(
+                min_dst_idx,
+                max_dst_idx + 1,
+                (src.size(0),),
+                dtype=torch.long,
+                device=device,
+            )
+        elif SAMPLING_STRATEGY == "popularity":
+            neg_dst = torch.multinomial(popularity + 1e-2, src.size(0), replacement=False).to(device)
+            popularity *= POPULARITY_DECAY
+            for entity in pos_dst:
+                popularity[entity.item()] += 1
+        else:
+            raise NotImplementedError("Sampling strategy not implemented")
 
         n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
@@ -108,8 +122,43 @@ def train():
     return total_loss / train_data.num_events
 
 
+def predict(positive_src, positive_dst, negatives):
+    dst = torch.tensor(
+                np.concatenate(
+                    ([np.array([positive_dst]), np.array(negatives)]),
+                    axis=0,
+                ),
+                device=device,
+            )
+    src = torch.full((dst.shape[0],), positive_src, device=device)
+    n_id = torch.cat([src, dst]).unique()
+    n_id, edge_index, e_id = neighbor_loader(n_id)
+    assoc[n_id] = torch.arange(n_id.size(0), device=device)
+
+    # Get updated memory of all nodes involved in the computation.
+    z, last_update = model["memory"](n_id)
+    z = model["gnn"](
+        z,
+        last_update,
+        edge_index,
+        data.t[e_id].to(device),
+        data.msg[e_id].to(device),
+    )
+
+    y_pred = model["link_pred"](z[assoc[src]], z[assoc[dst]])
+    count_oversaturated_predictions = torch.sum(y_pred[1:,:].flatten() == 1.0).item()
+
+    input_dict = {
+        "y_pred_pos": np.array([y_pred[0, :].squeeze(dim=-1).cpu()]),
+        "y_pred_neg": np.array(y_pred[1:, :].squeeze(dim=-1).cpu()),# + noise,
+        "eval_metric": [metric],
+    }
+    mrr = evaluator.eval(input_dict)[metric]
+
+    return mrr, count_oversaturated_predictions
+
 @torch.no_grad()
-def test(loader, neg_sampler, split_mode):
+def test(loader, neg_sampler, split_mode, popular_negatives: np.ndarray, src_dst_t_to_index: Dict):
     r"""
     Evaluated the dynamic link prediction
     Evaluation happens as 'one vs. many', meaning that each positive edge is evaluated against many negative edges
@@ -125,7 +174,11 @@ def test(loader, neg_sampler, split_mode):
     model['gnn'].eval()
     model['link_pred'].eval()
 
-    perf_list = []
+    naive_mrr = []
+    popular_top20_mrr = []
+
+    oversaturated_naive_sampling = []
+    oversaturated_popular_top20_sampling = []
 
     for pos_batch in loader:
         pos_src, pos_dst, pos_t, pos_msg = (
@@ -138,44 +191,33 @@ def test(loader, neg_sampler, split_mode):
         neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
 
         for idx, neg_batch in enumerate(neg_batch_list):
-            src = torch.full((1 + len(neg_batch),), pos_src[idx], device=device)
-            dst = torch.tensor(
-                np.concatenate(
-                    ([np.array([pos_dst.cpu().numpy()[idx]]), np.array(neg_batch)]),
-                    axis=0,
-                ),
-                device=device,
+            mrr, naive_candidates_oversaturated_predictions = predict(
+                positive_src=pos_src[idx],
+                positive_dst=pos_dst.cpu().numpy()[idx],
+                negatives=neg_batch,
             )
+            naive_mrr.append(mrr)
+            oversaturated_naive_sampling.append(naive_candidates_oversaturated_predictions)
 
-            n_id = torch.cat([src, dst]).unique()
-            n_id, edge_index, e_id = neighbor_loader(n_id)
-            assoc[n_id] = torch.arange(n_id.size(0), device=device)
-
-            # Get updated memory of all nodes involved in the computation.
-            z, last_update = model['memory'](n_id)
-            z = model['gnn'](
-                z,
-                last_update,
-                edge_index,
-                data.t[e_id].to(device),
-                data.msg[e_id].to(device),
+            neg_popular_index = src_dst_t_to_index[(pos_src[idx].item(), pos_dst[idx].item(), pos_t[idx].item())]
+            neg_popular = popular_negatives[neg_popular_index][:20]
+            mrr, popular_candidates_oversaturated_predictions = predict(
+                positive_src=pos_src[idx],
+                positive_dst=pos_dst.cpu().numpy()[idx],
+                negatives=neg_popular,
             )
-
-            y_pred = model['link_pred'](z[assoc[src]], z[assoc[dst]])
-
-            # compute MRR
-            input_dict = {
-                "y_pred_pos": np.array([y_pred[0, :].squeeze(dim=-1).cpu()]),
-                "y_pred_neg": np.array(y_pred[1:, :].squeeze(dim=-1).cpu()),
-                "eval_metric": [metric],
-            }
-            perf_list.append(evaluator.eval(input_dict)[metric])
+            popular_top20_mrr.append(mrr)
+            oversaturated_popular_top20_sampling.append(popular_candidates_oversaturated_predictions)
 
         # Update memory and neighbor loader with ground-truth state.
         model['memory'].update_state(pos_src, pos_dst, pos_t, pos_msg)
         neighbor_loader.insert(pos_src, pos_dst)
 
-    perf_metrics = float(torch.tensor(perf_list).mean())
+    perf_metrics = float(torch.tensor(naive_mrr).mean())
+    print(f"MRR on top 20 popular negatives: {float(torch.tensor(popular_top20_mrr).mean())}")
+
+    print(f"Oversaturated predictions on naive sampling: {np.mean(oversaturated_naive_sampling)}")
+    print(f"Oversaturated predictions on popular top 20 sampling: {np.mean(oversaturated_popular_top20_sampling)}")
 
     return perf_metrics
 
@@ -205,6 +247,21 @@ PATIENCE = args.patience
 NUM_RUNS = args.num_run
 NUM_NEIGHBORS = 10
 
+POPULARITY_DECAY = 0.95
+SAMPLING_STRATEGY = args.sampling_strategy
+
+NUM_TRAINING_EXAMPLES = 100_000
+NUM_VALIDATION_EXAMPLES = 10_000
+
+validation_popular_negatives = np.load(f"output/popular_neg_samples/{DATA}/popular_negatives_val.npy", mmap_mode="r")
+with open(f"output/popular_neg_samples/{DATA}/src_dst_t_to_index_val.pickle", "rb") as handle:
+    # mapping from (src, dst, t) to the index of the corresponding negative edge
+    validation_src_dst_t_to_index = pickle.load(handle)
+
+test_popular_negatives = np.load(f"output/popular_neg_samples/{DATA}/popular_negatives_test.npy", mmap_mode="r")
+with open(f"output/popular_neg_samples/{DATA}/src_dst_t_to_index_test.pickle", "rb") as handle:
+    # mapping from (src, dst, t) to the index of the corresponding negative edge
+    test_src_dst_t_to_index = pickle.load(handle)
 
 MODEL_NAME = 'TGN'
 # ==========
@@ -213,6 +270,7 @@ MODEL_NAME = 'TGN'
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # data loading
+
 dataset = PyGLinkPropPredDataset(name=DATA, root="datasets")
 train_mask = dataset.train_mask
 val_mask = dataset.val_mask
@@ -221,8 +279,8 @@ data = dataset.get_TemporalData()
 data = data.to(device)
 metric = dataset.eval_metric
 
-train_data = data[train_mask]
-val_data = data[val_mask]
+train_data = data[train_mask][-NUM_TRAINING_EXAMPLES:]
+val_data = data[val_mask][:NUM_VALIDATION_EXAMPLES]
 test_data = data[test_mask]
 
 train_loader = TemporalDataLoader(train_data, batch_size=BATCH_SIZE)
@@ -314,7 +372,7 @@ for run_idx in range(NUM_RUNS):
 
         # validation
         start_val = timeit.default_timer()
-        perf_metric_val = test(val_loader, neg_sampler, split_mode="val")
+        perf_metric_val = test(val_loader, neg_sampler, split_mode="val", popular_negatives=validation_popular_negatives, src_dst_t_to_index=validation_src_dst_t_to_index)
         print(f"\tValidation {metric}: {perf_metric_val: .4f}")
         print(f"\tValidation: Elapsed time (s): {timeit.default_timer() - start_val: .4f}")
         val_perf_list.append(perf_metric_val)
@@ -326,35 +384,35 @@ for run_idx in range(NUM_RUNS):
     train_val_time = timeit.default_timer() - start_train_val
     print(f"Train & Validation: Elapsed Time (s): {train_val_time: .4f}")
 
-    # ==================================================== Test
-    # first, load the best model
-    early_stopper.load_checkpoint(model)
+#     # ==================================================== Test
+#     # first, load the best model
+#     early_stopper.load_checkpoint(model)
 
-    # loading the test negative samples
-    dataset.load_test_ns()
+#     # loading the test negative samples
+#     dataset.load_test_ns()
 
-    # final testing
-    start_test = timeit.default_timer()
-    perf_metric_test = test(test_loader, neg_sampler, split_mode="test")
+#     # final testing
+#     start_test = timeit.default_timer()
+#     perf_metric_test = test(test_loader, neg_sampler, split_mode="test", popular_negatives=test_popular_negatives, src_dst_t_to_index=test_src_dst_t_to_index)
 
-    print(f"INFO: Test: Evaluation Setting: >>> ONE-VS-MANY <<< ")
-    print(f"\tTest: {metric}: {perf_metric_test: .4f}")
-    test_time = timeit.default_timer() - start_test
-    print(f"\tTest: Elapsed Time (s): {test_time: .4f}")
+#     print(f"INFO: Test: Evaluation Setting: >>> ONE-VS-MANY <<< ")
+#     print(f"\tTest: {metric}: {perf_metric_test: .4f}")
+#     test_time = timeit.default_timer() - start_test
+#     print(f"\tTest: Elapsed Time (s): {test_time: .4f}")
 
-    save_results({'model': MODEL_NAME,
-                  'data': DATA,
-                  'run': run_idx,
-                  'seed': SEED,
-                  f'val {metric}': val_perf_list,
-                  f'test {metric}': perf_metric_test,
-                  'test_time': test_time,
-                  'tot_train_val_time': train_val_time
-                  }, 
-    results_filename)
+#     save_results({'model': MODEL_NAME,
+#                   'data': DATA,
+#                   'run': run_idx,
+#                   'seed': SEED,
+#                   f'val {metric}': val_perf_list,
+#                   f'test {metric}': perf_metric_test,
+#                   'test_time': test_time,
+#                   'tot_train_val_time': train_val_time
+#                   },
+#     results_filename)
 
-    print(f"INFO: >>>>> Run: {run_idx}, elapsed time: {timeit.default_timer() - start_run: .4f} <<<<<")
-    print('-------------------------------------------------------------------------------')
+#     print(f"INFO: >>>>> Run: {run_idx}, elapsed time: {timeit.default_timer() - start_run: .4f} <<<<<")
+#     print('-------------------------------------------------------------------------------')
 
-print(f"Overall Elapsed Time (s): {timeit.default_timer() - start_overall: .4f}")
-print("==============================================================")
+# print(f"Overall Elapsed Time (s): {timeit.default_timer() - start_overall: .4f}")
+# print("==============================================================")

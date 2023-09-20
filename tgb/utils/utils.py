@@ -55,6 +55,7 @@ def get_args():
     parser.add_argument('--tolerance', type=float, help='Early stopper tolerance', default=1e-6)
     parser.add_argument('--patience', type=float, help='Early stopper patience', default=5)
     parser.add_argument('--num_run', type=int, help='Number of iteration runs', default=1)
+    parser.add_argument('--sampling-strategy', type=str, help='Sampling strategy', default="naive", choices=["naive", "popularity"])
 
     try:
         args = parser.parse_args()
