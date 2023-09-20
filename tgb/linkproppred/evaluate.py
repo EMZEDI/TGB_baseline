@@ -73,7 +73,7 @@ class Evaluator(object):
 
         return y_pred_pos, y_pred_neg
 
-    def _eval_hits_and_mrr(self, y_pred_pos, y_pred_neg, type_info, k_value):
+    def _eval_hits_and_mrr(self, y_pred_pos, y_pred_neg, type_info, k_value, average_rank: bool):
         r"""
         compute hist@k and mrr
         reference:
@@ -99,29 +99,33 @@ class Evaluator(object):
             pessimistic_rank = (y_pred_neg >= y_pred_pos).sum(dim=1)
             ranking_list = 0.5 * (optimistic_rank + pessimistic_rank) + 1
             hitsK_list = (ranking_list <= k_value).to(torch.float)
-            mrr_list = 1./ranking_list.to(torch.float)
+            if average_rank:
+                possible_mrr_scores = 1./ranking_list.to(torch.float)
+            else:
+                possible_mrr_scores = [np.mean([1 / (i + 1) for i in range(opt, pess + 1)]) for opt, pess in zip(optimistic_rank, pessimistic_rank)]
 
             return {
                     f'hits@{k_value}': hitsK_list.mean(),
-                    'mrr': mrr_list.mean()
+                    'mrr': np.mean(possible_mrr_scores)
                     }
 
         else:
             y_pred_pos = y_pred_pos.reshape(-1, 1)
-            optimistic_rank = (y_pred_neg >= y_pred_pos).sum(axis=1)
-            pessimistic_rank = (y_pred_neg > y_pred_pos).sum(axis=1)
+            optimistic_rank = (y_pred_neg > y_pred_pos).sum(axis=1)
+            pessimistic_rank = (y_pred_neg >= y_pred_pos).sum(axis=1)
             ranking_list = 0.5 * (optimistic_rank + pessimistic_rank) + 1
             hitsK_list = (ranking_list <= k_value).astype(np.float32)
-            mrr_list = 1./ranking_list.astype(np.float32)
+            if average_rank:
+                possible_mrr_scores = 1./ranking_list.astype(np.float32)
+            else:
+                possible_mrr_scores = [np.mean([1 / (i + 1) for i in range(opt, pess + 1)]) for opt, pess in zip(optimistic_rank, pessimistic_rank)]
 
             return {
                     f'hits@{k_value}': hitsK_list.mean(),
-                    'mrr': mrr_list.mean()
+                    'mrr': np.mean(possible_mrr_scores)
                     }
 
-    def eval(self, 
-             input_dict: dict, 
-             verbose: bool = False) -> dict:
+    def eval(self, input_dict: dict, verbose: bool = False, average_rank=True) -> dict:
         r"""
         evaluate the link prediction task
         this method is callable through an instance of this object to compute the metric
@@ -135,7 +139,7 @@ class Evaluator(object):
             perf_dict: a dictionary containing the computed performance metric
         """
         y_pred_pos, y_pred_neg = self._parse_and_check_input(input_dict)  # convert the predictions to numpy
-        perf_dict = self._eval_hits_and_mrr(y_pred_pos, y_pred_neg, type_info='numpy', k_value=self.k_value)
+        perf_dict = self._eval_hits_and_mrr(y_pred_pos, y_pred_neg, type_info='numpy', k_value=self.k_value, average_rank=average_rank)
         
         return perf_dict
     
