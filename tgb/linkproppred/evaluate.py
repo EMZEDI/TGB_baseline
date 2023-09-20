@@ -99,26 +99,25 @@ class Evaluator(object):
             pessimistic_rank = (y_pred_neg >= y_pred_pos).sum(dim=1)
             ranking_list = 0.5 * (optimistic_rank + pessimistic_rank) + 1
             hitsK_list = (ranking_list <= k_value).to(torch.float)
-            mrr_list = 1./ranking_list.to(torch.float)
+            possible_mrr_scores = [np.mean([1 / (i + 1) for i in range(opt, pess + 1)]) for opt, pess in zip(optimistic_rank, pessimistic_rank)]
 
             return {
                     f'hits@{k_value}': hitsK_list.mean(),
-                    'mrr': mrr_list.mean()
+                    'mrr': np.mean(possible_mrr_scores)
                     }
 
         else:
             y_pred_pos = y_pred_pos.reshape(-1, 1)
-            optimistic_rank = (y_pred_neg >= y_pred_pos).sum(axis=1)
-            pessimistic_rank = (y_pred_neg > y_pred_pos).sum(axis=1)
+            optimistic_rank = (y_pred_neg > y_pred_pos).sum(axis=1)
+            pessimistic_rank = (y_pred_neg >= y_pred_pos).sum(axis=1)
             ranking_list = 0.5 * (optimistic_rank + pessimistic_rank) + 1
             hitsK_list = (ranking_list <= k_value).astype(np.float32)
-            mrr_list = 1./ranking_list.astype(np.float32)
+            possible_mrr_scores = [np.mean([1 / (i + 1) for i in range(opt, pess + 1)]) for opt, pess in zip(optimistic_rank, pessimistic_rank)]
 
             return {
                     f'hits@{k_value}': hitsK_list.mean(),
-                    'mrr': mrr_list.mean()
+                    'mrr': np.mean(possible_mrr_scores)
                     }
-
     def eval(self, 
              input_dict: dict, 
              verbose: bool = False) -> dict:
