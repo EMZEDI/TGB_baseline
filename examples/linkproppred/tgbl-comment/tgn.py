@@ -38,6 +38,7 @@ from modules.early_stopping import  EarlyStopMonitor
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tqdm import tqdm
 from typing import Dict
+from tgb.utils.sliding_window_counter import SlidingWindowCounter
 
 
 # ==========
@@ -122,7 +123,7 @@ def train():
     return total_loss / train_data.num_events
 
 
-def predict(positive_src, positive_dst, negatives):
+def make_predictions(positive_src, positive_dst, negatives):
     dst = torch.tensor(
                 np.concatenate(
                     ([np.array([positive_dst]), np.array(negatives)]),
@@ -145,8 +146,11 @@ def predict(positive_src, positive_dst, negatives):
         data.msg[e_id].to(device),
     )
 
-    y_pred = model["link_pred"](z[assoc[src]], z[assoc[dst]])
-    count_oversaturated_predictions = torch.sum(y_pred[1:,:].flatten() == 1.0).item()
+    return model["link_pred"](z[assoc[src]], z[assoc[dst]])
+
+def predict(positive_src, positive_dst, negatives):
+    y_pred = make_predictions(positive_src, positive_dst, negatives)
+    count_oversaturated_predictions = torch.sum(y_pred.flatten() == 1.0).item()
 
     input_dict = {
         "y_pred_pos": np.array([y_pred[0, :].squeeze(dim=-1).cpu()]),
@@ -180,7 +184,19 @@ def test(loader, neg_sampler, split_mode, popular_negatives: np.ndarray, src_dst
     oversaturated_naive_sampling = []
     oversaturated_popular_top20_sampling = []
 
-    for pos_batch in loader:
+    oversaturated_K50_N5000 = []
+    oversaturated_K100_N5000 = []
+    oversaturated_K1000_N5000 = []
+
+    oversaturated_K50_N100000 = []
+    oversaturated_K100_N100000 = []
+    oversaturated_K1000_N100000 = []
+
+    oversaturated_K50_N20000 = []
+    oversaturated_K100_N20000 = []
+    oversaturated_K1000_N20000 = []
+
+    for pos_batch in tqdm(loader, desc=f"Testing ({split_mode})", total=len(loader)):
         pos_src, pos_dst, pos_t, pos_msg = (
             pos_batch.src,
             pos_batch.dst,
@@ -190,6 +206,10 @@ def test(loader, neg_sampler, split_mode, popular_negatives: np.ndarray, src_dst
 
         neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
 
+        top_K1000_N5000 = torch.tensor([i[0] for i in counter_last_5_000.counter.most_common(1_000)])
+        top_K1000_N20000 = torch.tensor([i[0] for i in counter_last_20_000.counter.most_common(1_000)])
+        top_K1000_N100000 = torch.tensor([i[0] for i in counter_last_100_000.counter.most_common(1_000)])
+
         for idx, neg_batch in enumerate(neg_batch_list):
             mrr, naive_candidates_oversaturated_predictions = predict(
                 positive_src=pos_src[idx],
@@ -197,7 +217,8 @@ def test(loader, neg_sampler, split_mode, popular_negatives: np.ndarray, src_dst
                 negatives=neg_batch,
             )
             naive_mrr.append(mrr)
-            oversaturated_naive_sampling.append(naive_candidates_oversaturated_predictions)
+            # + 1 for positive example
+            oversaturated_naive_sampling.append(naive_candidates_oversaturated_predictions / (len(neg_batch) + 1))
 
             neg_popular_index = src_dst_t_to_index[(pos_src[idx].item(), pos_dst[idx].item(), pos_t[idx].item())]
             neg_popular = popular_negatives[neg_popular_index][:20]
@@ -207,17 +228,49 @@ def test(loader, neg_sampler, split_mode, popular_negatives: np.ndarray, src_dst
                 negatives=neg_popular,
             )
             popular_top20_mrr.append(mrr)
-            oversaturated_popular_top20_sampling.append(popular_candidates_oversaturated_predictions)
+            oversaturated_popular_top20_sampling.append(popular_candidates_oversaturated_predictions / (len(neg_popular) + 1))
+
+            predictions = make_predictions(pos_src[idx].item(), pos_dst.cpu().numpy()[idx], top_K1000_N5000)
+            # indexing from 1: to exclude the positive example
+            oversaturated_K1000_N5000.append(torch.sum(predictions[1:,:].flatten() == 1.0).item() / 1_000)
+            oversaturated_K100_N5000.append(torch.sum(predictions[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_K50_N5000.append(torch.sum(predictions[1:51,:].flatten() == 1.0).item() / 50)
+
+            predictions = make_predictions(pos_src[idx].item(), pos_dst.cpu().numpy()[idx], top_K1000_N20000)
+            oversaturated_K1000_N20000.append(torch.sum(predictions[1:,:].flatten() == 1.0).item() / 1_000)
+            oversaturated_K100_N20000.append(torch.sum(predictions[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_K50_N20000.append(torch.sum(predictions[1:51,:].flatten() == 1.0).item() / 50)
+
+            predictions = make_predictions(pos_src[idx].item(), pos_dst.cpu().numpy()[idx], top_K1000_N100000)
+            oversaturated_K1000_N100000.append(torch.sum(predictions[1:,:].flatten() == 1.0).item() / 1_000)
+            oversaturated_K100_N100000.append(torch.sum(predictions[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_K50_N100000.append(torch.sum(predictions[1:51,:].flatten() == 1.0).item() / 50)
+
 
         # Update memory and neighbor loader with ground-truth state.
         model['memory'].update_state(pos_src, pos_dst, pos_t, pos_msg)
         neighbor_loader.insert(pos_src, pos_dst)
 
+        for dst in pos_dst:
+            counter_last_100_000.add(dst.item())
+            counter_last_20_000.add(dst.item())
+            counter_last_5_000.add(dst.item())
+
     perf_metrics = float(torch.tensor(naive_mrr).mean())
     print(f"MRR on top 20 popular negatives: {float(torch.tensor(popular_top20_mrr).mean())}")
 
-    print(f"Oversaturated predictions on naive sampling: {np.mean(oversaturated_naive_sampling)}")
-    print(f"Oversaturated predictions on popular top 20 sampling: {np.mean(oversaturated_popular_top20_sampling)}")
+    print(f"Oversaturated predictions on naive sampling: {np.mean(oversaturated_naive_sampling)*100:.2f}%")
+    print(f"Oversaturated predictions on popular top 20 sampling: {np.mean(oversaturated_popular_top20_sampling)*100:.2f}%")
+
+    print(f"Oversaturated predictions on K=50, N=5,000: {np.mean(oversaturated_K50_N5000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=100, N=5,000: {np.mean(oversaturated_K100_N5000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=1,000, N=5,000: {np.mean(oversaturated_K1000_N5000)*100:.4f}%")
+    print(f"Oversaturated predictions on K=50, N=20,000: {np.mean(oversaturated_K50_N20000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=100, N=20,000: {np.mean(oversaturated_K100_N20000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=1,000, N=20,000: {np.mean(oversaturated_K1000_N20000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=50, N=100,000: {np.mean(oversaturated_K50_N100000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=100, N=100,000: {np.mean(oversaturated_K100_N100000)*100:.2f}%")
+    print(f"Oversaturated predictions on K=1,000, N=100,000: {np.mean(oversaturated_K1000_N100000)*100:.2f}%")
 
     return perf_metrics
 
@@ -237,7 +290,7 @@ DATA = "tgbl-comment"
 LR = args.lr
 BATCH_SIZE = args.bs
 K_VALUE = args.k_value  
-NUM_EPOCH = args.num_epoch
+NUM_EPOCH = 1
 SEED = args.seed
 MEM_DIM = args.mem_dim
 TIME_DIM = args.time_dim
@@ -366,6 +419,16 @@ for run_idx in range(NUM_RUNS):
         # training
         start_epoch_train = timeit.default_timer()
         loss = train()
+
+        counter_last_100_000 = SlidingWindowCounter(100_000)
+        counter_last_20_000 = SlidingWindowCounter(20_000)
+        counter_last_5_000 = SlidingWindowCounter(5_000)
+
+        for dst in train_data.dst[-100_000:]:
+            counter_last_100_000.add(dst.item())
+            counter_last_20_000.add(dst.item())
+            counter_last_5_000.add(dst.item())
+
         print(
             f"Epoch: {epoch:02d}, Loss: {loss:.4f}, Training elapsed Time (s): {timeit.default_timer() - start_epoch_train: .4f}"
         )
