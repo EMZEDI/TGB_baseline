@@ -46,7 +46,8 @@ def test(data, test_mask, neg_sampler, split_mode):
     """
     num_batches = math.ceil(len(data['sources'][test_mask]) / BATCH_SIZE)
     perf_list = []
-    for batch_idx in tqdm(range(num_batches)):
+    oversaturated_preictions_all = []
+    for batch_idx in tqdm(range(num_batches), desc=f"Test: {split_mode}", total=num_batches):
         start_idx = batch_idx * BATCH_SIZE
         end_idx = min(start_idx + BATCH_SIZE, len(data['sources'][test_mask]))
         pos_src, pos_dst, pos_t = (
@@ -68,12 +69,13 @@ def test(data, test_mask, neg_sampler, split_mode):
                 "eval_metric": [metric],
             }
             perf_list.append(evaluator.eval(input_dict)[metric])
-            
+            oversaturated_preictions_all.append((y_pred == 1.0).sum() / len(y_pred))
+
         # update edgebank memory after each positive batch
         edgebank.update_memory(pos_src, pos_dst, pos_t)
 
     perf_metrics = float(np.mean(perf_list))
-
+    print(f"Oversaturated predictions for split_mode {split_mode}: {np.mean(oversaturated_preictions_all)*100:.4f}%")
     return perf_metrics
 
 def get_args():
