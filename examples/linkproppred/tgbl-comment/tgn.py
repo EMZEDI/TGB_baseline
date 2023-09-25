@@ -38,6 +38,7 @@ from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 import pickle
 import random
 from tqdm import tqdm
+from tgb.utils.sliding_window_counter import SlidingWindowCounter
 
 
 # ==========
@@ -94,6 +95,11 @@ def train():
                 popularity_raised = torch.pow(popularity, POPULARITY_POWER)
                 denominator = torch.sum(popularity_raised)
                 neg_dst = torch.multinomial(popularity_raised / denominator, src.size(0), replacement=False).to(device)
+
+            popularity *= POPULARITY_DECAY
+            for entity in pos_dst:
+                popularity[entity.item()] += 1
+
         n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
         assoc[n_id] = torch.arange(n_id.size(0), device=device)
@@ -181,6 +187,18 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
     oversaturated_popular_top100_sampling = []
     oversaturated_popular_top500_sampling = []
 
+    oversaturated_K50_N5000 = []
+    oversaturated_K100_N5000 = []
+    oversaturated_K1000_N5000 = []
+
+    oversaturated_K50_N100000 = []
+    oversaturated_K100_N100000 = []
+    oversaturated_K1000_N100000 = []
+
+    oversaturated_K50_N20000 = []
+    oversaturated_K100_N20000 = []
+    oversaturated_K1000_N20000 = []
+
     for batch_ix, pos_batch in tqdm(enumerate(loader), desc="Testing", total=len(loader)):
         pos_src, pos_dst, pos_t, pos_msg = (
             pos_batch.src,
@@ -190,6 +208,10 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
         )
 
         neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
+
+        top_K1000_N5000 = torch.tensor([i[0] for i in counter_last_5_000.counter.most_common(1_000)])
+        top_K1000_N20000 = torch.tensor([i[0] for i in counter_last_20_000.counter.most_common(1_000)])
+        top_K1000_N100000 = torch.tensor([i[0] for i in counter_last_100_000.counter.most_common(1_000)])
 
         for idx, neg_batch in enumerate(neg_batch_list):
             naive_predictions = predict(neg_batch, pos_src[idx], pos_dst.cpu().numpy()[idx])
@@ -230,11 +252,33 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
             }
             popular_top500_mrr.append(evaluator.eval(mrr_popular_input_dict_top500)[metric])
 
+            # calcualate oversaturation
+            predictions_N5000 = predict(top_K1000_N5000, pos_src[idx], pos_dst.cpu().numpy()[idx])
+            # indexing from 1: to exclude the positive example
+            oversaturated_K1000_N5000.append(torch.sum(predictions_N5000[1:1001,:].flatten() == 1.0).item() / 1000)
+            oversaturated_K100_N5000.append(torch.sum(predictions_N5000[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_K50_N5000.append(torch.sum(predictions_N5000[1:51,:].flatten() == 1.0).item() / 50)
+
+            predictions_N20000 = predict(top_K1000_N20000, pos_src[idx], pos_dst.cpu().numpy()[idx])
+            oversaturated_K1000_N20000.append(torch.sum(predictions_N20000[1:1001,:].flatten() == 1.0).item() / 1000)
+            oversaturated_K100_N20000.append(torch.sum(predictions_N20000[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_K50_N20000.append(torch.sum(predictions_N20000[1:51,:].flatten() == 1.0).item() / 50)
+
+            predictions_N100000 = predict(top_K1000_N100000, pos_src[idx], pos_dst.cpu().numpy()[idx])
+            oversaturated_K1000_N100000.append(torch.sum(predictions_N100000[1:1001,:].flatten() == 1.0).item() / 1000)
+            oversaturated_K100_N100000.append(torch.sum(predictions_N100000[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_K50_N100000.append(torch.sum(predictions_N100000[1:51,:].flatten() == 1.0).item() / 50)
+
         # Update memory and neighbor loader with ground-truth state.
         model['memory'].update_state(pos_src, pos_dst, pos_t, pos_msg)
         neighbor_loader.insert(pos_src, pos_dst)
 
-        if batch_ix > 0 and batch_ix % 200 == 0:
+        for dst in pos_dst:
+            counter_last_100_000.add(dst.item())
+            counter_last_20_000.add(dst.item())
+            counter_last_5_000.add(dst.item())
+
+        if batch_ix > 0 and batch_ix % 500 == 0:
             tqdm.write(str(batch_ix))
             tqdm.write(f"Naive MRR: {float(torch.tensor(perf_list).mean())}")
             tqdm.write(f"Popular MRR top 20: {float(torch.tensor(popular_top20_mrr).mean())}")
@@ -244,6 +288,15 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
             tqdm.write(f"Oversaturated Popular Top 20 Sampling: {float(torch.tensor(oversaturated_popular_top20_sampling).mean())}")
             tqdm.write(f"Oversaturated Popular Top 100 Sampling: {float(torch.tensor(oversaturated_popular_top100_sampling).mean())}")
             tqdm.write(f"Oversaturated Popular Top 500 Sampling: {float(torch.tensor(oversaturated_popular_top500_sampling).mean())}")
+            tqdm.write(f"Oversaturated K50 N5000: {float(torch.tensor(oversaturated_K50_N5000).mean())}")
+            tqdm.write(f"Oversaturated K100 N5000: {float(torch.tensor(oversaturated_K100_N5000).mean())}")
+            tqdm.write(f"Oversaturated K1000 N5000: {float(torch.tensor(oversaturated_K1000_N5000).mean())}")
+            tqdm.write(f"Oversaturated K50 N20000: {float(torch.tensor(oversaturated_K50_N20000).mean())}")
+            tqdm.write(f"Oversaturated K100 N20000: {float(torch.tensor(oversaturated_K100_N20000).mean())}")
+            tqdm.write(f"Oversaturated K1000 N20000: {float(torch.tensor(oversaturated_K1000_N20000).mean())}")
+            tqdm.write(f"Oversaturated K50 N100000: {float(torch.tensor(oversaturated_K50_N100000).mean())}")
+            tqdm.write(f"Oversaturated K100 N100000: {float(torch.tensor(oversaturated_K100_N100000).mean())}")
+            tqdm.write(f"Oversaturated K1000 N100000: {float(torch.tensor(oversaturated_K1000_N100000).mean())}")
 
     perf_metrics = float(torch.tensor(perf_list).mean())
 
@@ -255,6 +308,15 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
     print(f"Oversaturated Popular Top 20 Sampling: {float(torch.tensor(oversaturated_popular_top20_sampling).mean())}")
     print(f"Oversaturated Popular Top 100 Sampling: {float(torch.tensor(oversaturated_popular_top100_sampling).mean())}")
     print(f"Oversaturated Popular Top 500 Sampling: {float(torch.tensor(oversaturated_popular_top500_sampling).mean())}")
+    print(f"Oversaturated K50 N5000: {float(torch.tensor(oversaturated_K50_N5000).mean())}")
+    print(f"Oversaturated K100 N5000: {float(torch.tensor(oversaturated_K100_N5000).mean())}")
+    print(f"Oversaturated K1000 N5000: {float(torch.tensor(oversaturated_K1000_N5000).mean())}")
+    print(f"Oversaturated K50 N20000: {float(torch.tensor(oversaturated_K50_N20000).mean())}")
+    print(f"Oversaturated K100 N20000: {float(torch.tensor(oversaturated_K100_N20000).mean())}")
+    print(f"Oversaturated K1000 N20000: {float(torch.tensor(oversaturated_K1000_N20000).mean())}")
+    print(f"Oversaturated K50 N100000: {float(torch.tensor(oversaturated_K50_N100000).mean())}")
+    print(f"Oversaturated K100 N100000: {float(torch.tensor(oversaturated_K100_N100000).mean())}")
+    print(f"Oversaturated K1000 N100000: {float(torch.tensor(oversaturated_K1000_N100000).mean())}")
     return perf_metrics
 
 # ==========
@@ -290,6 +352,7 @@ print(f"RANDOM_RATIO: {RANDOM_RATIO}")
 print(f"POPULARITY_DECAY: {POPULARITY_DECAY}")
 print(f"POPULARITY_POWER: {POPULARITY_POWER}")
 SAMPLING_STRATEGY = args.sampling_strategy
+print(f"SAMPLING_STRATEGY: {SAMPLING_STRATEGY}")
 
 validation_popular_negatives = np.load(f"output/popular_neg_samples/{DATA}/popular_negatives_val.npy", mmap_mode="r")
 with open(f"output/popular_neg_samples/{DATA}/src_dst_t_to_index_val.pickle", "rb") as handle:
@@ -407,7 +470,14 @@ for run_idx in range(NUM_RUNS):
         print(
             f"Epoch: {epoch:02d}, Loss: {loss:.4f}, Training elapsed Time (s): {timeit.default_timer() - start_epoch_train: .4f}"
         )
+        counter_last_100_000 = SlidingWindowCounter(100_000)
+        counter_last_20_000 = SlidingWindowCounter(20_000)
+        counter_last_5_000 = SlidingWindowCounter(5_000)
 
+        for dst in train_data.dst[-100_000:]:
+            counter_last_100_000.add(dst.item())
+            counter_last_20_000.add(dst.item())
+            counter_last_5_000.add(dst.item())
         # validation
         start_val = timeit.default_timer()
         perf_metric_val = test(val_loader, neg_sampler, split_mode="val",
