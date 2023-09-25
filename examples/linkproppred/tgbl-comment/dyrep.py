@@ -33,7 +33,9 @@ from modules.neighbor_loader import LastNeighborLoader
 from modules.memory_module import DyRepMemory
 from modules.early_stopping import  EarlyStopMonitor
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
-
+import pickle
+import random
+from tqdm import tqdm
 
 
 # ==========
@@ -49,20 +51,37 @@ def train():
     neighbor_loader.reset_state()  # Start with an empty graph.
 
     total_loss = 0
-    for batch in train_loader:
+    popularity = torch.zeros(data.num_nodes) + 1e-15
+    for batch in tqdm(train_loader, desc="Training", total=len(train_loader)):
         batch = batch.to(device)
         optimizer.zero_grad()
 
         src, pos_dst, t, msg = batch.src, batch.dst, batch.t, batch.msg
 
         # Sample negative destination nodes.
-        neg_dst = torch.randint(
-            min_dst_idx,
-            max_dst_idx + 1,
-            (src.size(0),),
-            dtype=torch.long,
-            device=device,
-        )
+        if SAMPLING_STRATEGY == "naive":
+            # Sample negative destination nodes.
+            neg_dst = torch.randint(
+                min_dst_idx,
+                max_dst_idx + 1,
+                (src.size(0),),
+                dtype=torch.long,
+                device=device,
+            )
+        elif SAMPLING_STRATEGY == "popularity":
+            if random.random() < RANDOM_RATIO:
+                neg_dst = torch.randint(
+                    min_dst_idx,
+                    max_dst_idx + 1,
+                    (src.size(0),),
+                    dtype=torch.long,
+                    device=device,
+                )
+            else:
+                popularity_raised = torch.pow(popularity, POPULARITY_POWER)
+                denominator = torch.sum(popularity_raised)
+                neg_dst = torch.multinomial(popularity_raised / denominator, src.size(0), replacement=False).to(device)
+
 
         n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
@@ -98,8 +117,29 @@ def train():
     return total_loss / train_data.num_events
 
 
+def predict(negatives, pos_src, pos_dst):
+    src = torch.full((1 + len(negatives),), pos_src, device=device)
+    dst = torch.tensor(
+        np.concatenate(
+            ([np.array([pos_dst]), np.array(negatives)]),
+            axis=0,
+        ),
+        device=device,
+    )
+
+    n_id = torch.cat([src, dst]).unique()
+    n_id, _, _ = neighbor_loader(n_id)
+    assoc[n_id] = torch.arange(n_id.size(0), device=device)
+
+    # Get updated memory of all nodes involved in the computation.
+    z, _ = model['memory'](n_id)
+
+    y_pred = model['link_pred'](z[assoc[src]], z[assoc[dst]])
+    return y_pred
+
+
 @torch.no_grad()
-def test_one_vs_many(loader, neg_sampler, split_mode):
+def test_one_vs_many(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index):
     """
     Evaluated the dynamic link prediction
     """
@@ -108,8 +148,17 @@ def test_one_vs_many(loader, neg_sampler, split_mode):
     model['link_pred'].eval()
 
     perf_list = []
+    popular_top20_mrr = []
+    popular_top100_mrr = []
+    popular_top500_mrr = []
 
-    for pos_batch in loader:
+    oversaturated_naive_sampling = []
+    oversaturated_popular_top20_sampling = []
+    oversaturated_popular_top100_sampling = []
+    oversaturated_popular_top500_sampling = []
+
+
+    for batch_ix, pos_batch in tqdm(enumerate(loader), desc="Testing", total=len(loader)):
         pos_src, pos_dst, pos_t, pos_msg = (
             pos_batch.src,
             pos_batch.dst,
@@ -117,34 +166,59 @@ def test_one_vs_many(loader, neg_sampler, split_mode):
             pos_batch.msg,
         )
 
-        neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
+        neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode)
 
         for idx, neg_batch in enumerate(neg_batch_list):
-            src = torch.full((1 + len(neg_batch),), pos_src[idx], device=device)
-            dst = torch.tensor(
-                np.concatenate(
-                    ([np.array([pos_dst.cpu().numpy()[idx]]), np.array(neg_batch)]),
-                    axis=0,
-                ),
-                device=device,
-            )
-
-            n_id = torch.cat([src, dst]).unique()
-            n_id, edge_index, e_id = neighbor_loader(n_id)
-            assoc[n_id] = torch.arange(n_id.size(0), device=device)
-
-            # Get updated memory of all nodes involved in the computation.
-            z, last_update = model['memory'](n_id)
-
-            y_pred = model['link_pred'](z[assoc[src]], z[assoc[dst]])
-            # compute MRR
-            input_dict = {
-                "y_pred_pos": np.array([y_pred[0, :].squeeze(dim=-1).cpu()]),
-                "y_pred_neg": np.array(y_pred[1:, :].squeeze(dim=-1).cpu()),
+            naive_predictions = predict(neg_batch, pos_src[idx], pos_dst.cpu().numpy()[idx])
+            oversaturated_naive_sampling.append(torch.sum(naive_predictions[1:,:].flatten() == 1.0).item() / len(neg_batch))
+            mrr_naive_input_dict = {
+                "y_pred_pos": np.array([naive_predictions[0, :].squeeze(dim=-1).cpu()]),
+                "y_pred_neg": np.array(naive_predictions[1:, :].squeeze(dim=-1).cpu()),
                 "eval_metric": [metric],
             }
-            perf_list.append(evaluator.eval(input_dict)[metric])
-        
+            perf_list.append(evaluator.eval(mrr_naive_input_dict)[metric])
+
+            # compute MRR for popular negatives
+            neg_popular_index = src_dst_t_to_index[(pos_src[idx].item(), pos_dst[idx].item(), pos_t[idx].item())]
+            neg_popular = popular_negatives[neg_popular_index][:500]
+            popular_predictions = predict(neg_popular, pos_src[idx], pos_dst.cpu().numpy()[idx])
+
+            oversaturated_popular_top20_sampling.append(torch.sum(popular_predictions[1:21,:].flatten() == 1.0).item() / 20)
+            oversaturated_popular_top100_sampling.append(torch.sum(popular_predictions[1:101,:].flatten() == 1.0).item() / 100)
+            oversaturated_popular_top500_sampling.append(torch.sum(popular_predictions[1:501,:].flatten() == 1.0).item() / 500)
+
+            mrr_popular_input_dict_top20 = {
+                "y_pred_pos": np.array([popular_predictions[0, :].squeeze(dim=-1).cpu()]),
+                "y_pred_neg": np.array(popular_predictions[1:21, :].squeeze(dim=-1).cpu()),
+                "eval_metric": [metric],
+            }
+            popular_top20_mrr.append(evaluator.eval(mrr_popular_input_dict_top20)[metric])
+
+            mrr_popular_input_dict_top100 = {
+                "y_pred_pos": np.array([popular_predictions[0, :].squeeze(dim=-1).cpu()]),
+                "y_pred_neg": np.array(popular_predictions[1:101, :].squeeze(dim=-1).cpu()),
+                "eval_metric": [metric],
+            }
+            popular_top100_mrr.append(evaluator.eval(mrr_popular_input_dict_top100)[metric])
+
+            mrr_popular_input_dict_top500 = {
+                "y_pred_pos": np.array([popular_predictions[0, :].squeeze(dim=-1).cpu()]),
+                "y_pred_neg": np.array(popular_predictions[1:501, :].squeeze(dim=-1).cpu()),
+                "eval_metric": [metric],
+            }
+            popular_top500_mrr.append(evaluator.eval(mrr_popular_input_dict_top500)[metric])
+
+        if batch_ix > 0 and batch_ix % 200 == 0:
+            tqdm.write(str(batch_ix))
+            tqdm.write(f"Naive MRR: {float(torch.tensor(perf_list).mean())}")
+            tqdm.write(f"Popular MRR top 20: {float(torch.tensor(popular_top20_mrr).mean())}")
+            tqdm.write(f"Popular MRR top 100: {float(torch.tensor(popular_top100_mrr).mean())}")
+            tqdm.write(f"Popular MRR top 500: {float(torch.tensor(popular_top500_mrr).mean())}")
+            tqdm.write(f"Oversaturated Naive Sampling: {float(torch.tensor(oversaturated_naive_sampling).mean())}")
+            tqdm.write(f"Oversaturated Popular Top 20 Sampling: {float(torch.tensor(oversaturated_popular_top20_sampling).mean())}")
+            tqdm.write(f"Oversaturated Popular Top 100 Sampling: {float(torch.tensor(oversaturated_popular_top100_sampling).mean())}")
+            tqdm.write(f"Oversaturated Popular Top 500 Sampling: {float(torch.tensor(oversaturated_popular_top500_sampling).mean())}")
+
         # update the memory with positive edges
         n_id = torch.cat([pos_src, pos_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
@@ -163,7 +237,14 @@ def test_one_vs_many(loader, neg_sampler, split_mode):
         neighbor_loader.insert(pos_src, pos_dst)
 
     perf_metric = float(torch.tensor(perf_list).mean())
-
+    print(f"Naive MRR: {perf_metric}")
+    print(f"Popular MRR top 20: {float(torch.tensor(popular_top20_mrr).mean())}")
+    print(f"Popular MRR top 100: {float(torch.tensor(popular_top100_mrr).mean())}")
+    print(f"Popular MRR top 500: {float(torch.tensor(popular_top500_mrr).mean())}")
+    print(f"Oversaturated Naive Sampling: {float(torch.tensor(oversaturated_naive_sampling).mean())}")
+    print(f"Oversaturated Popular Top 20 Sampling: {float(torch.tensor(oversaturated_popular_top20_sampling).mean())}")
+    print(f"Oversaturated Popular Top 100 Sampling: {float(torch.tensor(oversaturated_popular_top100_sampling).mean())}")
+    print(f"Oversaturated Popular Top 500 Sampling: {float(torch.tensor(oversaturated_popular_top500_sampling).mean())}")
     return perf_metric
 
 # ==========
@@ -177,7 +258,7 @@ start_overall = timeit.default_timer()
 args, _ = get_args()
 print("INFO: Arguments:", args)
 
-DATA = "tgbl-comment"
+DATA = args.data
 LR = args.lr
 BATCH_SIZE = args.bs
 K_VALUE = args.k_value  
@@ -191,10 +272,30 @@ PATIENCE = args.patience
 NUM_RUNS = args.num_run
 NUM_NEIGHBORS = 10
 
+POPULARITY_POWER = args.popularity_power
+POPULARITY_DECAY = args.popularity_decay
+RANDOM_RATIO = args.random_ratio
+print(f"RANDOM_RATIO: {RANDOM_RATIO}")
+print(f"POPULARITY_DECAY: {POPULARITY_DECAY}")
+print(f"POPULARITY_POWER: {POPULARITY_POWER}")
+SAMPLING_STRATEGY = args.sampling_strategy
+
 MODEL_NAME = 'DyRep'
 USE_SRC_EMB_IN_MSG = False
 USE_DST_EMB_IN_MSG = True
 # ==========
+
+
+
+validation_popular_negatives = np.load(f"output/popular_neg_samples/{DATA}/popular_negatives_val.npy", mmap_mode="r")
+with open(f"output/popular_neg_samples/{DATA}/src_dst_t_to_index_val.pickle", "rb") as handle:
+    # mapping from (src, dst, t) to the index of the corresponding negative edge
+    validation_src_dst_t_to_index = pickle.load(handle)
+
+test_popular_negatives = np.load(f"output/popular_neg_samples/{DATA}/popular_negatives_test.npy", mmap_mode="r")
+with open(f"output/popular_neg_samples/{DATA}/src_dst_t_to_index_test.pickle", "rb") as handle:
+    # mapping from (src, dst, t) to the index of the corresponding negative edge
+    test_src_dst_t_to_index = pickle.load(handle)
 
 # set the device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -257,7 +358,6 @@ criterion = torch.nn.BCEWithLogitsLoss()
 # Helper vector to map global node indices to local ones.
 assoc = torch.empty(data.num_nodes, dtype=torch.long, device=device)
 
-
 print("==========================================================")
 print(f"=================*** {MODEL_NAME}: LinkPropPred: {DATA} ***=============")
 print("==========================================================")
@@ -304,7 +404,9 @@ for run_idx in range(NUM_RUNS):
 
         # validation
         start_val = timeit.default_timer()
-        perf_metric_val = test_one_vs_many(val_loader, neg_sampler, split_mode="val")
+        perf_metric_val = test_one_vs_many(val_loader, neg_sampler, split_mode="val",
+                                           popular_negatives=validation_popular_negatives,
+                                           src_dst_t_to_index=validation_src_dst_t_to_index)
         print(f"\tValidation {metric}: {perf_metric_val: .4f}")
         print(f"\tValidation: Elapsed time (s): {timeit.default_timer() - start_val: .4f}")
         val_perf_list.append(perf_metric_val)
@@ -325,7 +427,9 @@ for run_idx in range(NUM_RUNS):
 
     # final testing
     start_test = timeit.default_timer()
-    perf_metric_test = test_one_vs_many(test_loader, neg_sampler, split_mode="test")
+    perf_metric_test = test_one_vs_many(test_loader, neg_sampler, split_mode="test",
+                                        popular_negatives=test_popular_negatives,
+                                        src_dst_t_to_index=test_src_dst_t_to_index)
 
     print(f"INFO: Test: Evaluation Setting: >>> ONE-VS-MANY <<< ")
     print(f"\tTest: {metric}: {perf_metric_test: .4f}")
