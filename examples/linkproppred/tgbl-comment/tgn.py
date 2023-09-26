@@ -99,6 +99,8 @@ def train():
             popularity *= POPULARITY_DECAY
             for entity in pos_dst:
                 popularity[entity.item()] += 1
+        else:
+            raise ValueError("Invalid sampling strategy")
 
         n_id = torch.cat([src, pos_dst, neg_dst]).unique()
         n_id, edge_index, e_id = neighbor_loader(n_id)
