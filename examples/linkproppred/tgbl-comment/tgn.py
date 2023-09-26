@@ -252,22 +252,23 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
             }
             popular_top500_mrr.append(evaluator.eval(mrr_popular_input_dict_top500)[metric])
 
-            # calcualate oversaturation
-            predictions_N5000 = predict(top_K1000_N5000, pos_src[idx], pos_dst.cpu().numpy()[idx])
-            # indexing from 1: to exclude the positive example
-            oversaturated_K1000_N5000.append(torch.sum(predictions_N5000[1:1001,:].flatten() == 1.0).item() / 1000)
-            oversaturated_K100_N5000.append(torch.sum(predictions_N5000[1:101,:].flatten() == 1.0).item() / 100)
-            oversaturated_K50_N5000.append(torch.sum(predictions_N5000[1:51,:].flatten() == 1.0).item() / 50)
+            if split_mode == "val":
+                # calcualate oversaturation
+                predictions_N5000 = predict(top_K1000_N5000, pos_src[idx], pos_dst.cpu().numpy()[idx])
+                # indexing from 1: to exclude the positive example
+                oversaturated_K1000_N5000.append(torch.sum(predictions_N5000[1:1001,:].flatten() == 1.0).item() / 1000)
+                oversaturated_K100_N5000.append(torch.sum(predictions_N5000[1:101,:].flatten() == 1.0).item() / 100)
+                oversaturated_K50_N5000.append(torch.sum(predictions_N5000[1:51,:].flatten() == 1.0).item() / 50)
 
-            predictions_N20000 = predict(top_K1000_N20000, pos_src[idx], pos_dst.cpu().numpy()[idx])
-            oversaturated_K1000_N20000.append(torch.sum(predictions_N20000[1:1001,:].flatten() == 1.0).item() / 1000)
-            oversaturated_K100_N20000.append(torch.sum(predictions_N20000[1:101,:].flatten() == 1.0).item() / 100)
-            oversaturated_K50_N20000.append(torch.sum(predictions_N20000[1:51,:].flatten() == 1.0).item() / 50)
+                predictions_N20000 = predict(top_K1000_N20000, pos_src[idx], pos_dst.cpu().numpy()[idx])
+                oversaturated_K1000_N20000.append(torch.sum(predictions_N20000[1:1001,:].flatten() == 1.0).item() / 1000)
+                oversaturated_K100_N20000.append(torch.sum(predictions_N20000[1:101,:].flatten() == 1.0).item() / 100)
+                oversaturated_K50_N20000.append(torch.sum(predictions_N20000[1:51,:].flatten() == 1.0).item() / 50)
 
-            predictions_N100000 = predict(top_K1000_N100000, pos_src[idx], pos_dst.cpu().numpy()[idx])
-            oversaturated_K1000_N100000.append(torch.sum(predictions_N100000[1:1001,:].flatten() == 1.0).item() / 1000)
-            oversaturated_K100_N100000.append(torch.sum(predictions_N100000[1:101,:].flatten() == 1.0).item() / 100)
-            oversaturated_K50_N100000.append(torch.sum(predictions_N100000[1:51,:].flatten() == 1.0).item() / 50)
+                predictions_N100000 = predict(top_K1000_N100000, pos_src[idx], pos_dst.cpu().numpy()[idx])
+                oversaturated_K1000_N100000.append(torch.sum(predictions_N100000[1:1001,:].flatten() == 1.0).item() / 1000)
+                oversaturated_K100_N100000.append(torch.sum(predictions_N100000[1:101,:].flatten() == 1.0).item() / 100)
+                oversaturated_K50_N100000.append(torch.sum(predictions_N100000[1:51,:].flatten() == 1.0).item() / 50)
 
         # Update memory and neighbor loader with ground-truth state.
         model['memory'].update_state(pos_src, pos_dst, pos_t, pos_msg)
@@ -278,7 +279,7 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
             counter_last_20_000.add(dst.item())
             counter_last_5_000.add(dst.item())
 
-        if batch_ix > 0 and batch_ix % 500 == 0:
+        if batch_ix > 0 and batch_ix % 1000 == 0:
             tqdm.write(str(batch_ix))
             tqdm.write(f"Naive MRR: {float(torch.tensor(perf_list).mean())}")
             tqdm.write(f"Popular MRR top 20: {float(torch.tensor(popular_top20_mrr).mean())}")
@@ -288,15 +289,16 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
             tqdm.write(f"Oversaturated Popular Top 20 Sampling: {float(torch.tensor(oversaturated_popular_top20_sampling).mean())}")
             tqdm.write(f"Oversaturated Popular Top 100 Sampling: {float(torch.tensor(oversaturated_popular_top100_sampling).mean())}")
             tqdm.write(f"Oversaturated Popular Top 500 Sampling: {float(torch.tensor(oversaturated_popular_top500_sampling).mean())}")
-            tqdm.write(f"Oversaturated K50 N5000: {float(torch.tensor(oversaturated_K50_N5000).mean())}")
-            tqdm.write(f"Oversaturated K100 N5000: {float(torch.tensor(oversaturated_K100_N5000).mean())}")
-            tqdm.write(f"Oversaturated K1000 N5000: {float(torch.tensor(oversaturated_K1000_N5000).mean())}")
-            tqdm.write(f"Oversaturated K50 N20000: {float(torch.tensor(oversaturated_K50_N20000).mean())}")
-            tqdm.write(f"Oversaturated K100 N20000: {float(torch.tensor(oversaturated_K100_N20000).mean())}")
-            tqdm.write(f"Oversaturated K1000 N20000: {float(torch.tensor(oversaturated_K1000_N20000).mean())}")
-            tqdm.write(f"Oversaturated K50 N100000: {float(torch.tensor(oversaturated_K50_N100000).mean())}")
-            tqdm.write(f"Oversaturated K100 N100000: {float(torch.tensor(oversaturated_K100_N100000).mean())}")
-            tqdm.write(f"Oversaturated K1000 N100000: {float(torch.tensor(oversaturated_K1000_N100000).mean())}")
+            if split_mode == "val":
+                tqdm.write(f"Oversaturated K50 N5000: {float(torch.tensor(oversaturated_K50_N5000).mean())}")
+                tqdm.write(f"Oversaturated K100 N5000: {float(torch.tensor(oversaturated_K100_N5000).mean())}")
+                tqdm.write(f"Oversaturated K1000 N5000: {float(torch.tensor(oversaturated_K1000_N5000).mean())}")
+                tqdm.write(f"Oversaturated K50 N20000: {float(torch.tensor(oversaturated_K50_N20000).mean())}")
+                tqdm.write(f"Oversaturated K100 N20000: {float(torch.tensor(oversaturated_K100_N20000).mean())}")
+                tqdm.write(f"Oversaturated K1000 N20000: {float(torch.tensor(oversaturated_K1000_N20000).mean())}")
+                tqdm.write(f"Oversaturated K50 N100000: {float(torch.tensor(oversaturated_K50_N100000).mean())}")
+                tqdm.write(f"Oversaturated K100 N100000: {float(torch.tensor(oversaturated_K100_N100000).mean())}")
+                tqdm.write(f"Oversaturated K1000 N100000: {float(torch.tensor(oversaturated_K1000_N100000).mean())}")
 
     perf_metrics = float(torch.tensor(perf_list).mean())
 
@@ -308,16 +310,37 @@ def test(loader, neg_sampler, split_mode, popular_negatives, src_dst_t_to_index)
     print(f"Oversaturated Popular Top 20 Sampling: {float(torch.tensor(oversaturated_popular_top20_sampling).mean())}")
     print(f"Oversaturated Popular Top 100 Sampling: {float(torch.tensor(oversaturated_popular_top100_sampling).mean())}")
     print(f"Oversaturated Popular Top 500 Sampling: {float(torch.tensor(oversaturated_popular_top500_sampling).mean())}")
-    print(f"Oversaturated K50 N5000: {float(torch.tensor(oversaturated_K50_N5000).mean())}")
-    print(f"Oversaturated K100 N5000: {float(torch.tensor(oversaturated_K100_N5000).mean())}")
-    print(f"Oversaturated K1000 N5000: {float(torch.tensor(oversaturated_K1000_N5000).mean())}")
-    print(f"Oversaturated K50 N20000: {float(torch.tensor(oversaturated_K50_N20000).mean())}")
-    print(f"Oversaturated K100 N20000: {float(torch.tensor(oversaturated_K100_N20000).mean())}")
-    print(f"Oversaturated K1000 N20000: {float(torch.tensor(oversaturated_K1000_N20000).mean())}")
-    print(f"Oversaturated K50 N100000: {float(torch.tensor(oversaturated_K50_N100000).mean())}")
-    print(f"Oversaturated K100 N100000: {float(torch.tensor(oversaturated_K100_N100000).mean())}")
-    print(f"Oversaturated K1000 N100000: {float(torch.tensor(oversaturated_K1000_N100000).mean())}")
-    return perf_metrics
+    if split_mode == "val":
+        print(f"Oversaturated K50 N5000: {float(torch.tensor(oversaturated_K50_N5000).mean())}")
+        print(f"Oversaturated K100 N5000: {float(torch.tensor(oversaturated_K100_N5000).mean())}")
+        print(f"Oversaturated K1000 N5000: {float(torch.tensor(oversaturated_K1000_N5000).mean())}")
+        print(f"Oversaturated K50 N20000: {float(torch.tensor(oversaturated_K50_N20000).mean())}")
+        print(f"Oversaturated K100 N20000: {float(torch.tensor(oversaturated_K100_N20000).mean())}")
+        print(f"Oversaturated K1000 N20000: {float(torch.tensor(oversaturated_K1000_N20000).mean())}")
+        print(f"Oversaturated K50 N100000: {float(torch.tensor(oversaturated_K50_N100000).mean())}")
+        print(f"Oversaturated K100 N100000: {float(torch.tensor(oversaturated_K100_N100000).mean())}")
+        print(f"Oversaturated K1000 N100000: {float(torch.tensor(oversaturated_K1000_N100000).mean())}")
+
+    result = {
+        "naive_mrr" : perf_metrics,
+        "popular_mrr_top20" : float(torch.tensor(popular_top20_mrr).mean()),
+        "popular_mrr_top100" : float(torch.tensor(popular_top100_mrr).mean()),
+        "popular_mrr_top500" : float(torch.tensor(popular_top500_mrr).mean()),
+    }
+    if split_mode == "val":
+        result["oversaturated_K50_N5000"] = float(torch.tensor(oversaturated_K50_N5000).mean())
+        result["oversaturated_K100_N5000"] = float(torch.tensor(oversaturated_K100_N5000).mean())
+        result["oversaturated_K1000_N5000"] = float(torch.tensor(oversaturated_K1000_N5000).mean())
+
+        result["oversaturated_K50_N20000"] = float(torch.tensor(oversaturated_K50_N20000).mean())
+        result["oversaturated_K100_N20000"] = float(torch.tensor(oversaturated_K100_N20000).mean())
+        result["oversaturated_K1000_N20000"] = float(torch.tensor(oversaturated_K1000_N20000).mean())
+
+        result["oversaturated_K50_N100000"] = float(torch.tensor(oversaturated_K50_N100000).mean())
+        result["oversaturated_K100_N100000"] = float(torch.tensor(oversaturated_K100_N100000).mean())
+        result["oversaturated_K1000_N100000"] = float(torch.tensor(oversaturated_K1000_N100000).mean())
+
+    return result
 
 # ==========
 # ==========
@@ -440,7 +463,7 @@ if not osp.exists(results_path):
     os.mkdir(results_path)
     print('INFO: Create directory {}'.format(results_path))
 Path(results_path).mkdir(parents=True, exist_ok=True)
-results_filename = f'{results_path}/{MODEL_NAME}_{DATA}_results.json'
+results_filename = f'{results_path}/{SAMPLING_STRATEGY}_{MODEL_NAME}_{DATA}_results.json'
 
 for run_idx in range(NUM_RUNS):
     print('-------------------------------------------------------------------------------')
@@ -453,7 +476,7 @@ for run_idx in range(NUM_RUNS):
 
     # define an early stopper
     save_model_dir = f'{osp.dirname(osp.abspath(__file__))}/saved_models/'
-    save_model_id = f'{MODEL_NAME}_{DATA}_{SEED}_{run_idx}'
+    save_model_id = f'{SAMPLING_STRATEGY}_{MODEL_NAME}_{DATA}_{SEED}_{run_idx}'
     early_stopper = EarlyStopMonitor(save_model_dir=save_model_dir, save_model_id=save_model_id, 
                                     tolerance=TOLERANCE, patience=PATIENCE)
 
@@ -480,15 +503,16 @@ for run_idx in range(NUM_RUNS):
             counter_last_5_000.add(dst.item())
         # validation
         start_val = timeit.default_timer()
-        perf_metric_val = test(val_loader, neg_sampler, split_mode="val",
+        val_result = test(val_loader, neg_sampler, split_mode="val",
                                  popular_negatives=validation_popular_negatives,
                                  src_dst_t_to_index=validation_src_dst_t_to_index)
-        print(f"\tValidation {metric}: {perf_metric_val: .4f}")
+        val_naive_mrr = val_result["naive_mrr"]
+        print(f"\tValidation {metric}: {val_naive_mrr: .4f}")
         print(f"\tValidation: Elapsed time (s): {timeit.default_timer() - start_val: .4f}")
-        val_perf_list.append(perf_metric_val)
+        val_perf_list.append(val_naive_mrr)
 
         # check for early stopping
-        if early_stopper.step_check(perf_metric_val, model):
+        if early_stopper.step_check(val_naive_mrr, model):
             break
 
     train_val_time = timeit.default_timer() - start_train_val
@@ -503,21 +527,38 @@ for run_idx in range(NUM_RUNS):
 
     # final testing
     start_test = timeit.default_timer()
-    perf_metric_test = test(test_loader, neg_sampler, split_mode="test",
+    test_result = test(test_loader, neg_sampler, split_mode="test",
                             popular_negatives=test_popular_negatives,
                             src_dst_t_to_index=test_src_dst_t_to_index)
 
+    test_naive_mrr = test_result["naive_mrr"]
     print(f"INFO: Test: Evaluation Setting: >>> ONE-VS-MANY <<< ")
-    print(f"\tTest: {metric}: {perf_metric_test: .4f}")
+    print(f"\tTest: {metric}: {test_naive_mrr: .4f}")
     test_time = timeit.default_timer() - start_test
     print(f"\tTest: Elapsed Time (s): {test_time: .4f}")
 
     save_results({'model': MODEL_NAME,
                   'data': DATA,
+                  'sampling_strategy': SAMPLING_STRATEGY,
                   'run': run_idx,
                   'seed': SEED,
                   f'val {metric}': val_perf_list,
-                  f'test {metric}': perf_metric_test,
+                  f'test {metric}': test_naive_mrr,
+                  'val_popular_mrr_top20': val_result["popular_mrr_top20"],
+                  'val_popular_mrr_top100': val_result["popular_mrr_top100"],
+                  'val_popular_mrr_top500': val_result["popular_mrr_top500"],
+                  'test_popular_mrr_top20': test_result["popular_mrr_top20"],
+                  'test_popular_mrr_top100': test_result["popular_mrr_top100"],
+                  'test_popular_mrr_top500': test_result["popular_mrr_top500"],
+                  'oversaturated_K50_N5000': val_result["oversaturated_K50_N5000"],
+                  'oversaturated_K100_N5000': val_result["oversaturated_K100_N5000"],
+                  'oversaturated_K1000_N5000': val_result["oversaturated_K1000_N5000"],
+                  'oversaturated_K50_N20000': val_result["oversaturated_K50_N20000"],
+                  'oversaturated_K100_N20000': val_result["oversaturated_K100_N20000"],
+                  'oversaturated_K1000_N20000': val_result["oversaturated_K1000_N20000"],
+                  'oversaturated_K50_N100000': val_result["oversaturated_K50_N100000"],
+                  'oversaturated_K100_N100000': val_result["oversaturated_K100_N100000"],
+                  'oversaturated_K1000_N100000': val_result["oversaturated_K1000_N100000"],
                   'test_time': test_time,
                   'tot_train_val_time': train_val_time
                   }, 
