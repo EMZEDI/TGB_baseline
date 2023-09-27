@@ -441,7 +441,7 @@ if not osp.exists(results_path):
     os.mkdir(results_path)
     print("INFO: Create directory {}".format(results_path))
 Path(results_path).mkdir(parents=True, exist_ok=True)
-results_filename = f"{results_path}/{SAMPLING_STRATEGY}_{MODEL_NAME}_{DATA}_results2.json"
+results_filename = f"{results_path}/{SAMPLING_STRATEGY}_{MODEL_NAME}_{DATA}_results.json"
 
 for run_idx in range(NUM_RUNS):
     print("-------------------------------------------------------------------------------")
@@ -454,7 +454,7 @@ for run_idx in range(NUM_RUNS):
 
     # define an early stopper
     save_model_dir = f"{osp.dirname(osp.abspath(__file__))}/saved_models/"
-    save_model_id = f"{SAMPLING_STRATEGY}_{MODEL_NAME}_{DATA}_{SEED}_{run_idx}_v2"
+    save_model_id = f"{SAMPLING_STRATEGY}_{MODEL_NAME}_{DATA}_{SEED}_{run_idx}"
     early_stopper = EarlyStopMonitor(
         save_model_dir=save_model_dir, save_model_id=save_model_id, tolerance=TOLERANCE, patience=PATIENCE
     )

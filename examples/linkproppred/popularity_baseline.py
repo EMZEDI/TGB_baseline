@@ -238,14 +238,16 @@ def run(dataset_name: str, initial_decay: float):
         else:
             break
         if decay >= 0.99:
-            decay += 0.0001
+            decay += 0.001
         else:
             decay += 0.01
     print(f"Best MRR: {best_mrr} for decay {best_decay}")
 
     dataset.load_test_ns()
     # Test set
-    popularity = train(train_loader, num_nodes=data.num_nodes, decay=initial_decay)
+    train_val_data = data[train_mask | val_mask]
+    train_val_loader = TemporalDataLoader(train_val_data, batch_size=BATCH_SIZE)
+    popularity = train(train_val_loader, num_nodes=data.num_nodes, decay=initial_decay)
     mrr = test(
         test_loader,
         neg_sampler,
@@ -260,6 +262,7 @@ def run(dataset_name: str, initial_decay: float):
 
 
 if __name__ == "__main__":
-    run("tgbl-comment", 0.95)
-    run("tgbl-review", initial_decay=0.99)
-    run("tgbl-coin", initial_decay=0.94)
+    run("tgbl-comment", 0.94)
+    run("tgbl-review", initial_decay=0.997)
+    run("tgbl-coin", initial_decay=0.93)
+    run("tgbl-wiki", initial_decay=0.36)
