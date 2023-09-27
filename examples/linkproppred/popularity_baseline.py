@@ -260,6 +260,6 @@ def run(dataset_name: str, initial_decay: float):
 
 
 if __name__ == "__main__":
-    run("tgbl-comment", 0.93)
+    run("tgbl-comment", 0.95)
     run("tgbl-review", initial_decay=0.99)
-    run("tgbl-coin", initial_decay=0.93)
+    run("tgbl-coin", initial_decay=0.94)
