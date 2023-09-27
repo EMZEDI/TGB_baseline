@@ -7,9 +7,9 @@ This repository contains the codebase supporting the findings of the paper "Temp
 ## Generating Recently Popular Negative Samples
 To bring evaluation results closer to real-world usefulness, we propose an improved evaluation method. This involves generating negative samples based on the popularity of items. Run the following script to generate these samples:
 
-\```bash
+```bash
 python tgb/datasets/dataset_scripts/popularity_neg_generator.py
-\```
+```
 
 The generated negative samples will be saved in `output/popular_neg_samples/{dataset_name}`.
 
@@ -44,6 +44,8 @@ python examples/linkproppred/dyrep.py --data <your-data-here> --sampling-strateg
 ```bash
 python examples/linkproppred/dyrep.py --data <your-data-here> --random-ratio 0.1 --sampling-strategy popularity
 ```
+
+Replace `<your-data-here>` with the dataset you intend to use (e.g., tgbl-coin).
 
 ## Temporal Popularity Baseline
 To run the temporal popularity baseline for dynamic link property prediction, execute:
