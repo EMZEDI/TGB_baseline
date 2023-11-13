@@ -14,9 +14,8 @@ BATCH_SIZE = 200
 
 # Evaluating only on naive negative sampling is faster
 # Set this to False to compute the top N popular negative sampling
-EVALUATE_ONLY_ON_NAIVE_NEG_SAMPLING = True
 
-
+# TODO: make this both inductive and generalizable to bipartite graphs
 def update_popularity(popularity: np.ndarray, dst_nodes: torch.Tensor, decay: float) -> np.ndarray:
     """
     Update the popularity array based on destination nodes and decay factor.
@@ -83,8 +82,6 @@ def test(
     popularity: torch.Tensor,
     decay: float,
     evaluator: Evaluator,
-    popular_negatives: np.array,
-    src_dst_t_to_index: Dict,
 ):
     """
     Test the popularity model and compute the Mean Reciprocal Rank (MRR).
@@ -96,37 +93,16 @@ def test(
         popularity: The popularity scores for each node.
         decay: The decay factor for popularity.
         evaluator: The evaluator object for computing metrics.
-        popular_negatives: The popular negative samples.
-        src_dst_t_to_index: The mapping from (src, dst, t) to index in popular_negatives.
 
     Returns:
         The Mean Reciprocal Rank (MRR) for the given data.
     """
-
-    def predict_top_N_popular_negatives(topN: int):
-        neg_popular_index = src_dst_t_to_index[(pos_src[idx].item(), pos_dst[idx].item(), pos_t[idx].item())]
-        neg_popular_candidates = popular_negatives[neg_popular_index]
-        candidates_top_N = np.concatenate([neg_popular_candidates[:topN], [ground_truth]])
-        scores = popularity[candidates_top_N]
-        input_dict = {
-            "y_pred_pos": np.array([scores[-1]]),
-            "y_pred_neg": scores[:-1],
-            "eval_metric": ["mrr"],
-        }
-        return evaluator.eval(input_dict)["mrr"]
-
     naive_mrr = []
-    top20_popular_mrr = []
-    top100_popular_mrr = []
-    top500_popular_mrr = []
-    all_mrr = []
 
     for pos_batch in tqdm(loader):
+        # we call it pos_batch because the test set only has positive samples
         pos_src, pos_dst, pos_t = pos_batch.src, pos_batch.dst, pos_batch.t
         neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
-
-        if not EVALUATE_ONLY_ON_NAIVE_NEG_SAMPLING:
-            predictions_all_topK = torch.topk(torch.tensor(popularity), k=1001, dim=-1)
 
         for idx, negative_candidates in enumerate(neg_batch_list):
             ground_truth = pos_dst[idx].item()
@@ -139,29 +115,11 @@ def test(
             }
 
             naive_mrr.append(evaluator.eval(input_dict)["mrr"])
-            if not EVALUATE_ONLY_ON_NAIVE_NEG_SAMPLING:
-                top20_popular_mrr.append(predict_top_N_popular_negatives(20))
-                top100_popular_mrr.append(predict_top_N_popular_negatives(100))
-                top500_popular_mrr.append(predict_top_N_popular_negatives(500))
-
-                input_dict = {
-                    "y_pred_pos": np.array([popularity[ground_truth]]),
-                    "y_pred_neg": popularity[
-                        predictions_all_topK.indices[predictions_all_topK.indices != ground_truth]
-                    ][:1000],
-                    "eval_metric": ["mrr"],
-                }
-                all_mrr.append(evaluator.eval(input_dict)["mrr"])
 
         popularity = update_popularity(popularity, pos_batch.dst, decay)
 
     naive_mrr = float(torch.tensor(naive_mrr).mean())
     print(f"Naive MRR: {naive_mrr}")
-    if not EVALUATE_ONLY_ON_NAIVE_NEG_SAMPLING:
-        print(f"Top 20 popular MRR: {float(torch.tensor(top20_popular_mrr).mean())}")
-        print(f"Top 100 popular MRR: {float(torch.tensor(top100_popular_mrr).mean())}")
-        print(f"Top 500 popular MRR: {float(torch.tensor(top500_popular_mrr).mean())}")
-        print(f"All MRR: {float(torch.tensor(all_mrr).mean())}")
 
     return naive_mrr
 
@@ -207,15 +165,6 @@ def run(dataset_name: str, initial_decay: float):
     decay = initial_decay
     best_decay = decay
 
-    popular_negatives_val = np.load(f"output/popular_neg_samples/{dataset_name}/popular_negatives_val.npy")
-    popular_negatives_test = np.load(f"output/popular_neg_samples/{dataset_name}/popular_negatives_test.npy")
-
-    with open(f"output/popular_neg_samples/{dataset_name}/src_dst_t_to_index_val.pickle", "rb") as f:
-        src_dst_t_to_index_val = pickle.load(f)
-
-    with open(f"output/popular_neg_samples/{dataset_name}/src_dst_t_to_index_test.pickle", "rb") as f:
-        src_dst_t_to_index_test = pickle.load(f)
-
     while True:
         if decay > 1.0:
             break
@@ -227,8 +176,6 @@ def run(dataset_name: str, initial_decay: float):
             popularity=popularity,
             decay=decay,
             evaluator=evaluator,
-            popular_negatives=popular_negatives_val,
-            src_dst_t_to_index=src_dst_t_to_index_val,
         )
         print(f"MRR: {mrr} for decay {decay}")
         mrr_per_decay[decay] = mrr
@@ -255,14 +202,12 @@ def run(dataset_name: str, initial_decay: float):
         popularity=popularity,
         decay=best_decay,
         evaluator=evaluator,
-        popular_negatives=popular_negatives_test,
-        src_dst_t_to_index=src_dst_t_to_index_test,
     )
     print(f"MRR on test set: {mrr}")
 
 
 if __name__ == "__main__":
     # run("tgbl-comment", 0.94)
-    # run("tgbl-review", initial_decay=0.997)
+    run("tgbl-review", initial_decay=0.997)
     # run("tgbl-coin", initial_decay=0.93)
-    run("tgbl-wiki", initial_decay=0.36)
+    # run("tgbl-wiki", initial_decay=0.36)
