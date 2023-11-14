@@ -16,7 +16,7 @@ BATCH_SIZE = 200
 # Set this to False to compute the top N popular negative sampling
 
 # TODO: make this both inductive and generalizable to bipartite graphs
-def update_popularity(popularity: np.ndarray, dst_nodes: torch.Tensor, decay: float) -> np.ndarray:
+def update_popularity(popularity: np.ndarray, nodes: torch.Tensor, decay: float) -> np.ndarray:
     """
     Update the popularity array based on destination nodes and decay factor.
 
@@ -28,8 +28,9 @@ def update_popularity(popularity: np.ndarray, dst_nodes: torch.Tensor, decay: fl
     Returns:
         Updated popularity array.
     """
-    for dst in dst_nodes:
-        popularity[dst.item()] += 1
+    for node in nodes:
+        popularity[node[0].item()] += 0.01
+        popularity[node[1].item()] += 1
     popularity *= decay
     return popularity
 
@@ -70,8 +71,9 @@ def train(train_loader: TemporalDataLoader, num_nodes: int, decay: float) -> np.
     """
     popularity = np.zeros(num_nodes)
     for batch in tqdm(train_loader):
-        dst_nodes = batch.dst
-        popularity = update_popularity(popularity, dst_nodes, decay)
+        # create nodes variable which consists of src, dst pairs for each edge in the batch as a 2tuple
+        nodes = torch.stack([batch.src, batch.dst], dim=1)
+        popularity = update_popularity(popularity, nodes, decay)
     return popularity
 
 
@@ -116,7 +118,8 @@ def test(
 
             naive_mrr.append(evaluator.eval(input_dict)["mrr"])
 
-        popularity = update_popularity(popularity, pos_batch.dst, decay)
+        nodes = torch.stack([pos_batch.src, pos_batch.dst], dim=1)
+        popularity = update_popularity(popularity, nodes, decay)
 
     naive_mrr = float(torch.tensor(naive_mrr).mean())
     print(f"Naive MRR: {naive_mrr}")
