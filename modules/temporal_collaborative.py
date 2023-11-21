@@ -80,7 +80,7 @@ class TCF(object):
         nodes.update([a.item() for a in test_data.src])
         nodes.update([a.item() for a in test_data.dst])
         self.NUM_NODES = len(nodes)
-        print("done here")
+        # print("done here")
 
         return train_loader, val_loader, test_loader
 
@@ -124,6 +124,7 @@ class TCF(object):
                 dst_item = dst.item()
                 if (src_item, dst_item) in self.bank:
                     self.bank[(src_item, dst_item)] += 1
+                    # TODO: the following might result in a blow up -> normalize
                     # to avoid the time complexity of the bank, we reverse decay it after each positive edge
                     self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**batch_counter
                 else:
@@ -169,7 +170,7 @@ class TCF(object):
 
                 # Calculate the dot product of the scores for the given node and the candid node
                 dot_product = sum(scores[dst] * self.bank.get((candid_node, dst), 0) for dst in scores if (candid_node, dst) in self.bank)
-                print("computed the dot product")
+                # print("computed the dot product")
                 # If the dot product is higher than the current maximum similarity
                 if dot_product > max_similarity:
                     # Update the maximum similarity and the most similar node
@@ -191,7 +192,7 @@ class TCF(object):
 
                 # Calculate the dot product of the scores for the given node and the candid node
                 dot_product = sum(scores[src] * self.bank.get((src, candid_node), 0) for src in scores if (src, candid_node) in self.bank)
-                print("computed the dot product")
+                # print("computed the dot product")
                 # If the dot product is higher than the current maximum similarity
                 if dot_product > max_similarity:
                     # Update the maximum similarity and the most similar node
