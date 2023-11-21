@@ -1,11 +1,8 @@
 import torch
-import numpy as np
 from torch_geometric.loader import TemporalDataLoader
-from torch_geometric.data import TemporalData
 from tqdm import tqdm
-from collections import defaultdict
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
-
+from tgb.linkproppred.evaluate import Evaluator
 
 class TCF(object):
     r"""
@@ -13,8 +10,8 @@ class TCF(object):
     """
 
     DEVICE: torch.DeviceObjType = torch.device("cpu")
-    # TODO: Make the implementation compatible with CUDA.
-    BATCH_SIZE: int = 200
+    # TODO: Make the implementation compatible with CUDA?
+    BATCH_SIZE: int = 5000
 
     TRAIN_DATA = None
     VAL_DATA = None
@@ -23,7 +20,7 @@ class TCF(object):
     def __init__(
         self,
         dataset_name: str,
-        decay: float = 0.95,
+        decay: float = 0.955,
         device: torch.DeviceObjType = DEVICE,
         batch_size: int = BATCH_SIZE,
     ):
@@ -36,12 +33,7 @@ class TCF(object):
 
         self.TRAIN_DATA, self.VAL_DATA, self.TEST_DATA = self._train_test_split(dataset)
 
-        # Initialize sim_track and bank as 2D dictionaries
-        # TODO: this is not memory efficient, use sparse tensors instead
-
-        # Create sparse tensors
-        self.sim_track = torch.sparse_coo_tensor(indices=torch.empty((2, 0)), values=torch.empty(0), size=(self.NUM_NODES, self.NUM_NODES))
-        self.bank = torch.sparse_coo_tensor(indices=torch.empty((2, 0)), values=torch.empty(0), size=(self.NUM_NODES, self.NUM_NODES))
+        self.bank = {}
 
     def _train_test_split(
         self, dataset: PyGLinkPropPredDataset
@@ -111,6 +103,11 @@ class TCF(object):
 
         return sorted_src, sorted_dst, sorted_ts
 
+    def _dict_to_sparse(self, dict_obj):
+        indices = list(zip(*dict_obj.keys()))
+        values = list(dict_obj.values())
+        return torch.sparse_coo_tensor(indices=indices, values=values, size=(self.NUM_NODES, self.NUM_NODES))
+
     def train(self) -> None:
         """
         Train the temporal collaborative filtering model.
@@ -119,49 +116,92 @@ class TCF(object):
             f"Training the temporal collaborative filtering model for O({self.NUM_NODES}^2) edges."
         )
 
+        batch_counter = 1
         # iterate over each batch
         for batch in tqdm(self.TRAIN_DATA, desc="Training"):
             for src, dst in zip(batch.src, batch.dst):
-                self.bank[src.item()][dst.item()] += 1
-                self._update_similarities()
+                src_item = src.item()
+                dst_item = dst.item()
+                if (src_item, dst_item) in self.bank:
+                    self.bank[(src_item, dst_item)] += 1
+                    # to avoid the time complexity of the bank, we reverse decay it after each positive edge
+                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**batch_counter
+                else:
+                    self.bank[(src_item, dst_item)] = 1
+                # print("Train: updated the bank")
 
-            # decay the bank
-            self._decay_bank()
-
+            batch_counter += 1
+        
         return
 
     def _decay_bank(self) -> None:
         """
         Decay the bank by multiplying with the decay factor.
         """
-        self.bank *= self.DECAY
+        for key in self.bank:
+            self.bank[key] *= self.DECAY
         return
 
-    def _update_similarities(self) -> None:
+    def _get_most_similar_to(self, node: int, is_source: bool = True) -> int:
+        """Get the most similar node to the given node.
+
+        Args:
+            node (int): the item associated with the candid node
+            is_source (bool, optional): whether the given node is a source or a destination. Defaults to True.
         """
-        Update the similarity matrix based on the bank.
-        """
-        # # TODO: make this efficient
-        # for item in range(len(self.sim_track)):
-        #     for candid in range(len(self.sim_track[item])):
-        #         common_destinations = torch.nonzero((self.bank[item] > 0) & (self.bank[candid] > 0))
 
-        #         # find the similarity between item and candid based on the common destinations.
-        #         # multiply the self.bank[item][destination] by self.bank[candid][destination] for each destination in common_destinations and sum them up.
-        #         similarity = torch.dot(self.bank[item][common_destinations], self.bank[candid][common_destinations])
-        #         self.sim_track[item][candid] = similarity
+        # Initialize the maximum similarity and the most similar node
+        max_similarity = -1
+        most_similar = -1
 
-        # Convert the bank to a sparse tensor
-        sparse_bank = self.bank.to_sparse()
+        if is_source:
+            # Get the scores for the destinations seen by the given node
+            scores = {dst: value for (src, dst), value in self.bank.items() if src == node}
 
-        # Compute the dot product of the bank with its transpose
-        self.sim_track = torch.sparse.mm(sparse_bank, sparse_bank.t()).to_dense()
+            # Get the unique source nodes in self.bank
+            unique_nodes = set(src for (src, _), _ in self.bank.items())
 
-        return
+            # Iterate over unique source nodes
+            for candid_node in unique_nodes:
+                # Skip if the candid node is the given node
+                if candid_node == node:
+                    continue
 
-    def predict(
-        self, src: torch.Tensor, dst: torch.Tensor, ts: torch.Tensor
-    ) -> torch.Tensor:
+                # Calculate the dot product of the scores for the given node and the candid node
+                dot_product = sum(scores[dst] * self.bank.get((candid_node, dst), 0) for dst in scores if (candid_node, dst) in self.bank)
+                print("computed the dot product")
+                # If the dot product is higher than the current maximum similarity
+                if dot_product > max_similarity:
+                    # Update the maximum similarity and the most similar node
+                    max_similarity = dot_product
+                    most_similar = candid_node
+
+        else:
+            # Get the scores for the sources seen by the given node
+            scores = {src: value for (src, dst), value in self.bank.items() if dst == node}
+
+            # Get the unique destination nodes in self.bank
+            unique_nodes = set(dst for (_, dst), _ in self.bank.items())
+
+            # Iterate over unique destination nodes
+            for candid_node in unique_nodes:
+                # Skip if the candid node is the given node
+                if candid_node == node:
+                    continue
+
+                # Calculate the dot product of the scores for the given node and the candid node
+                dot_product = sum(scores[src] * self.bank.get((src, candid_node), 0) for src in scores if (src, candid_node) in self.bank)
+                print("computed the dot product")
+                # If the dot product is higher than the current maximum similarity
+                if dot_product > max_similarity:
+                    # Update the maximum similarity and the most similar node
+                    max_similarity = dot_product
+                    most_similar = candid_node
+
+        return most_similar
+    
+
+    def predict(self, src: torch.Tensor, dst: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
         """
         Predict the probability of the given edges.
 
@@ -180,21 +220,20 @@ class TCF(object):
         probs = torch.zeros(len(src))
 
         # iterate over each edge
-        for i, (src, dst, ts) in enumerate(zip(sorted_src, sorted_dst, sorted_ts)):
-            # get the most similar node to source, max of the similarity matrix over the row corresponding to source
-            most_similar_src = torch.argmax(self.sim_track[src.item()])
-            # get the most similar node to destination, max of the similarity matrix over the row corresponding to destination
-            most_similar_dst = torch.argmax(self.sim_track[dst.item()])
+        for i, (src_item, dst_item, ts) in enumerate(zip(sorted_src, sorted_dst, sorted_ts)):
+            # find the most similar source to the given source and the most similar destination to the given destination
+            most_similar_src = self._get_most_similar_to(src_item.item())
+            most_similar_dst = self._get_most_similar_to(dst_item.item(), is_source=False)
 
             # if the bank has seen an edge between the most similar source and the destination and the most similar destination and the source, predict as 1, otherwise if one of them, 0.5, otherwise 0
             if (
-                self.bank[most_similar_src][dst.item()] > 0
-                and self.bank[most_similar_dst][src.item()] > 0
+                (most_similar_src, dst_item.item()) in self.bank
+                and (src_item.item(), most_similar_dst) in self.bank
             ):
                 probs[i] = 1
             elif (
-                self.bank[most_similar_src][dst.item()] > 0
-                or self.bank[most_similar_dst][src.item()] > 0
+                (most_similar_src, dst_item.item()) in self.bank
+                or (src_item.item(), most_similar_dst) in self.bank
             ):
                 probs[i] = 0.5
             else:
@@ -204,6 +243,32 @@ class TCF(object):
 
     # def evaluate
 
-    # def test
+    # def test(self, negative_sampler, split_mode: str, evaluator: Evaluator) -> None:
+        # """
+        # Test the temporal collaborative filtering model.
+
+        # Args:
+        #     negative_sampler (NegativeSampler): the negative sampler
+        #     split_mode (str): the split mode
+        #     evaluator (Evaluator): the evaluator
+        # """
+        # print(f"Testing the temporal collaborative filtering model.")
+
+        # # initialize the scores
+        # scores = torch.zeros(len(self.TEST_DATA.src))
+
+        # # iterate over each batch
+        # for pos_batch in tqdm(self.TEST_DATA, desc="Testing"):
+
+        #         pos_src, pos_dst, pos_t = pos_batch.src, pos_batch.dst, pos_batch.t
+        #         neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
+
+        #     # predict the scores for the edges in the batch
+        #     scores[batch.indices] = self.predict(batch.src, batch.dst, batch.t)
+
+        # # evaluate the scores
+        # evaluator.eval(scores, self.TEST_DATA, split_mode)
+
+        # return
 
     # def run
