@@ -3,6 +3,7 @@ from torch_geometric.loader import TemporalDataLoader
 from tqdm import tqdm
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
+import numpy as np
 
 class TCF(object):
     r"""
@@ -24,12 +25,15 @@ class TCF(object):
         device: torch.DeviceObjType = DEVICE,
         batch_size: int = BATCH_SIZE,
     ):
+        self.dataset_name = dataset_name
         self.device = device
         self.DECAY: float = decay
         self.batch_size = batch_size
 
         # load the dataset
         dataset = PyGLinkPropPredDataset(name=dataset_name, root="data")
+        self.negative_sampler = dataset.negative_sampler
+        self.dataset = dataset
 
         self.TRAIN_DATA, self.VAL_DATA, self.TEST_DATA = self._train_test_split(dataset)
 
@@ -116,7 +120,7 @@ class TCF(object):
             f"Training the temporal collaborative filtering model for O({self.NUM_NODES}^2) edges."
         )
 
-        batch_counter = 1
+        self.batch_counter = 1
         # iterate over each batch
         for batch in tqdm(self.TRAIN_DATA, desc="Training"):
             for src, dst in zip(batch.src, batch.dst):
@@ -126,21 +130,13 @@ class TCF(object):
                     self.bank[(src_item, dst_item)] += 1
                     # TODO: the following might result in a blow up -> normalize
                     # to avoid the time complexity of the bank, we reverse decay it after each positive edge
-                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**batch_counter
+                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**self.batch_counter
                 else:
                     self.bank[(src_item, dst_item)] = 1
                 # print("Train: updated the bank")
 
-            batch_counter += 1
+            self.batch_counter += 1
         
-        return
-
-    def _decay_bank(self) -> None:
-        """
-        Decay the bank by multiplying with the decay factor.
-        """
-        for key in self.bank:
-            self.bank[key] *= self.DECAY
         return
 
     def _get_most_similar_to(self, node: int, is_source: bool = True) -> int:
@@ -221,55 +217,87 @@ class TCF(object):
         probs = torch.zeros(len(src))
 
         # iterate over each edge
-        for i, (src_item, dst_item, ts) in enumerate(zip(sorted_src, sorted_dst, sorted_ts)):
+        for i, (src_item, dst_item) in enumerate(zip(sorted_src, sorted_dst)):
             # find the most similar source to the given source and the most similar destination to the given destination
             most_similar_src = self._get_most_similar_to(src_item.item())
-            most_similar_dst = self._get_most_similar_to(dst_item.item(), is_source=False)
+            # most_similar_dst = self._get_most_similar_to(dst_item.item(), is_source=False)
 
             # if the bank has seen an edge between the most similar source and the destination and the most similar destination and the source, predict as 1, otherwise if one of them, 0.5, otherwise 0
-            if (
-                (most_similar_src, dst_item.item()) in self.bank
-                and (src_item.item(), most_similar_dst) in self.bank
-            ):
-                probs[i] = 1
-            elif (
-                (most_similar_src, dst_item.item()) in self.bank
-                or (src_item.item(), most_similar_dst) in self.bank
-            ):
-                probs[i] = 0.5
-            else:
-                probs[i] = 0
+            # if (
+            #     (most_similar_src, dst_item.item()) in self.bank
+            #     and (src_item.item(), most_similar_dst) in self.bank
+            # ):
+            #     probs[i] = 1
+            # elif (
+            #     (most_similar_src, dst_item.item()) in self.bank
+            #     or (src_item.item(), most_similar_dst) in self.bank
+            # ):
+            #     probs[i] = 0.5
+            # else:
+            #     probs[i] = 0
+
+            probs[i] = int((most_similar_src, dst_item.item()) in self.bank)
 
         return probs
 
-    # def evaluate
+    def val_test(self, split_mode: str="test") -> None:
+        """
+        Test the temporal collaborative filtering model.
 
-    # def test(self, negative_sampler, split_mode: str, evaluator: Evaluator) -> None:
-        # """
-        # Test the temporal collaborative filtering model.
+        Args:
+            negative_sampler (NegativeSampler): the negative sampler
+            split_mode (str): the split mode. Defaults to "test"
+        """
+        if split_mode == "test":
+            print(f"Testing the temporal collaborative filtering model.")
+            data = self.TEST_DATA
+            self.dataset.load_test_ns()
+        else:
+            print(f"Validating the temporal collaborative filtering model.")
+            data = self.VAL_DATA
+            self.dataset.load_val_ns()
 
-        # Args:
-        #     negative_sampler (NegativeSampler): the negative sampler
-        #     split_mode (str): the split mode
-        #     evaluator (Evaluator): the evaluator
-        # """
-        # print(f"Testing the temporal collaborative filtering model.")
 
-        # # initialize the scores
-        # scores = torch.zeros(len(self.TEST_DATA.src))
+        evaluator = Evaluator(name=self.dataset_name)
+        naive_mrr = []
 
-        # # iterate over each batch
-        # for pos_batch in tqdm(self.TEST_DATA, desc="Testing"):
+        # iterate over each batch
+        for pos_batch in tqdm(data, desc="Testing"):
+            pos_src, pos_dst, pos_t = pos_batch.src, pos_batch.dst, pos_batch.t
+            neg_batch_list = self.negative_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
 
-        #         pos_src, pos_dst, pos_t = pos_batch.src, pos_batch.dst, pos_batch.t
-        #         neg_batch_list = neg_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
+            for idx, negative_candidates in tqdm(enumerate(neg_batch_list)):
+                print("entered the loop for a batch")
+                query_src = torch.Tensor([int(pos_src[idx]) for _ in range(len(negative_candidates) + 1)])
+                query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates]))
+                query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(len(negative_candidates) + 1)])
+                print(len(query_src), len(query_dst), len(query_ts))
+                scores = self.predict(query_src, query_dst, query_ts)
+                print("computed the scores for a batch")
+                input_dict = {
+                        "y_pred_pos": np.array([scores[0]]),
+                        "y_pred_neg": np.array(scores[1:]),
+                        # TODO: change the following to use the evaluator's metric
+                        "eval_metric": ["mrr"],
+                    }
+                naive_mrr.append(evaluator.eval(input_dict)["mrr"])
 
-        #     # predict the scores for the edges in the batch
-        #     scores[batch.indices] = self.predict(batch.src, batch.dst, batch.t)
+            # update the bank after each positive batch has been seen
+            for src, dst in zip(pos_batch.src, pos_batch.dst):
+                src_item = src.item()
+                dst_item = dst.item()
+                if (src_item, dst_item) in self.bank:
+                    self.bank[(src_item, dst_item)] += 1
+                    # TODO: the following might result in a blow up -> normalize
+                    # to avoid the time complexity of the bank, we reverse decay it after each positive edge
+                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**self.batch_counter
+                else:
+                    self.bank[(src_item, dst_item)] = 1
+            
+            self.batch_counter += 1
 
-        # # evaluate the scores
-        # evaluator.eval(scores, self.TEST_DATA, split_mode)
-
-        # return
+        naive_mrr = float(torch.tensor(naive_mrr).mean())
+        print(f"Naive MRR: {naive_mrr}")
+        return naive_mrr
 
     # def run
