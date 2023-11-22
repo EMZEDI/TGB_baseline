@@ -4,6 +4,7 @@ from tqdm import tqdm
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
 import numpy as np
+from time import time
 
 class TCF(object):
     r"""
@@ -12,7 +13,7 @@ class TCF(object):
 
     DEVICE: torch.DeviceObjType = torch.device("cpu")
     # TODO: Make the implementation compatible with CUDA?
-    BATCH_SIZE: int = 5000
+    BATCH_SIZE: int = 200
 
     TRAIN_DATA = None
     VAL_DATA = None
@@ -107,11 +108,6 @@ class TCF(object):
 
         return sorted_src, sorted_dst, sorted_ts
 
-    def _dict_to_sparse(self, dict_obj):
-        indices = list(zip(*dict_obj.keys()))
-        values = list(dict_obj.values())
-        return torch.sparse_coo_tensor(indices=indices, values=values, size=(self.NUM_NODES, self.NUM_NODES))
-
     def train(self) -> None:
         """
         Train the temporal collaborative filtering model.
@@ -127,10 +123,11 @@ class TCF(object):
                 src_item = src.item()
                 dst_item = dst.item()
                 if (src_item, dst_item) in self.bank:
-                    self.bank[(src_item, dst_item)] += 1
                     # TODO: the following might result in a blow up -> normalize
                     # to avoid the time complexity of the bank, we reverse decay it after each positive edge
-                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**self.batch_counter
+                    # the logic here might be wrong
+                    self.bank[(src_item, dst_item)] += 1
+                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)
                 else:
                     self.bank[(src_item, dst_item)] = 1
                 # print("Train: updated the bank")
@@ -139,17 +136,19 @@ class TCF(object):
         
         return
 
-    def _get_most_similar_to(self, node: int, is_source: bool = True) -> int:
-        """Get the most similar node to the given node.
+    def _get_most_similar_to(self, node: int, is_source: bool = True) -> list[int]:
+        """Get the 20 most similar nodes to the given node.
 
         Args:
             node (int): the item associated with the candid node
-            is_source (bool, optional): whether the given node is a source or a destination. Defaults to True.
+            is_source (bool): whether the given node is a source node
+
+        Returns:
+            list[int]: list of the 20 most similar nodes
         """
 
-        # Initialize the maximum similarity and the most similar node
-        max_similarity = -1
-        most_similar = -1
+        # Initialize a dictionary to store the similarities for each candidate node
+        similarities = {}
 
         if is_source:
             # Get the scores for the destinations seen by the given node
@@ -166,34 +165,15 @@ class TCF(object):
 
                 # Calculate the dot product of the scores for the given node and the candid node
                 dot_product = sum(scores[dst] * self.bank.get((candid_node, dst), 0) for dst in scores if (candid_node, dst) in self.bank)
-                # print("computed the dot product")
-                # If the dot product is higher than the current maximum similarity
-                if dot_product > max_similarity:
-                    # Update the maximum similarity and the most similar node
-                    max_similarity = dot_product
-                    most_similar = candid_node
 
-        else:
-            # Get the scores for the sources seen by the given node
-            scores = {src: value for (src, dst), value in self.bank.items() if dst == node}
+                # Store the dot product in the dictionary
+                similarities[candid_node] = dot_product
 
-            # Get the unique destination nodes in self.bank
-            unique_nodes = set(dst for (_, dst), _ in self.bank.items())
+        # Add the node itself to the dictionary with a high similarity
+        similarities[node] = float('inf')
 
-            # Iterate over unique destination nodes
-            for candid_node in unique_nodes:
-                # Skip if the candid node is the given node
-                if candid_node == node:
-                    continue
-
-                # Calculate the dot product of the scores for the given node and the candid node
-                dot_product = sum(scores[src] * self.bank.get((src, candid_node), 0) for src in scores if (src, candid_node) in self.bank)
-                # print("computed the dot product")
-                # If the dot product is higher than the current maximum similarity
-                if dot_product > max_similarity:
-                    # Update the maximum similarity and the most similar node
-                    max_similarity = dot_product
-                    most_similar = candid_node
+        # Get the 20 most similar nodes
+        most_similar = sorted(similarities, key=similarities.get, reverse=True)[:5000]
 
         return most_similar
     
@@ -218,25 +198,16 @@ class TCF(object):
 
         # iterate over each edge
         for i, (src_item, dst_item) in enumerate(zip(sorted_src, sorted_dst)):
-            # find the most similar source to the given source and the most similar destination to the given destination
-            most_similar_src = self._get_most_similar_to(src_item.item())
-            # most_similar_dst = self._get_most_similar_to(dst_item.item(), is_source=False)
+            # find the 20 most similar nodes to the given source
+            most_similar_nodes = self._get_most_similar_to(src_item.item())
 
-            # if the bank has seen an edge between the most similar source and the destination and the most similar destination and the source, predict as 1, otherwise if one of them, 0.5, otherwise 0
-            # if (
-            #     (most_similar_src, dst_item.item()) in self.bank
-            #     and (src_item.item(), most_similar_dst) in self.bank
-            # ):
-            #     probs[i] = 1
-            # elif (
-            #     (most_similar_src, dst_item.item()) in self.bank
-            #     or (src_item.item(), most_similar_dst) in self.bank
-            # ):
-            #     probs[i] = 0.5
-            # else:
-            #     probs[i] = 0
+            # count the number of most similar nodes that have had a link to the destination
+            count = sum(1 for node in most_similar_nodes if (node, dst_item.item()) in self.bank)
 
-            probs[i] = int((most_similar_src, dst_item.item()) in self.bank)
+            # if more than 1/3 of the most similar nodes have had a link to the destination, predict as 1, otherwise predict as 0
+            # TODO: the threshold might be low - adjust based on surprise rate
+            if count > 100:
+                probs[i] = 1
 
         return probs
 
@@ -261,19 +232,29 @@ class TCF(object):
         evaluator = Evaluator(name=self.dataset_name)
         naive_mrr = []
 
+        
         # iterate over each batch
         for pos_batch in tqdm(data, desc="Testing"):
+            tmp_counter = 1
             pos_src, pos_dst, pos_t = pos_batch.src, pos_batch.dst, pos_batch.t
             neg_batch_list = self.negative_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
 
             for idx, negative_candidates in tqdm(enumerate(neg_batch_list)):
-                print("entered the loop for a batch")
-                query_src = torch.Tensor([int(pos_src[idx]) for _ in range(len(negative_candidates) + 1)])
-                query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates]))
-                query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(len(negative_candidates) + 1)])
-                print(len(query_src), len(query_dst), len(query_ts))
+                tmp_counter += 1
+                if tmp_counter > 2:
+                    break
+                # query_src = torch.Tensor([int(pos_src[idx]) for _ in range(len(negative_candidates) + 1)])
+                # query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates]))
+                query_src = torch.Tensor([int(pos_src[idx]) for _ in range(min(3, len(negative_candidates)) + 1)])
+                query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates[:3]]))
+                query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(min(3, len(negative_candidates)) + 1)])
+                # print(query_dst)
+                # query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(len(negative_candidates) + 1)])
+
+                # print(len(query_src), len(query_dst), len(query_ts))
                 scores = self.predict(query_src, query_dst, query_ts)
                 print("computed the scores for a batch")
+                print(f"prediction score is {scores[0]}, and the wrong prediction score is {scores[1], scores[2]}")
                 input_dict = {
                         "y_pred_pos": np.array([scores[0]]),
                         "y_pred_neg": np.array(scores[1:]),
@@ -290,11 +271,11 @@ class TCF(object):
                     self.bank[(src_item, dst_item)] += 1
                     # TODO: the following might result in a blow up -> normalize
                     # to avoid the time complexity of the bank, we reverse decay it after each positive edge
-                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)**self.batch_counter
+                    self.bank[(src_item, dst_item)] *= (1 / self.DECAY)
                 else:
                     self.bank[(src_item, dst_item)] = 1
             
-            self.batch_counter += 1
+            # self.batch_counter += 1
 
         naive_mrr = float(torch.tensor(naive_mrr).mean())
         print(f"Naive MRR: {naive_mrr}")
