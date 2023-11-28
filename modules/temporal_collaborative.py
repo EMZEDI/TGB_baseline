@@ -12,12 +12,9 @@ class TCF(object):
     The temporal collaborative filtering model.
     """
 
-    DEVICE: torch.DeviceObjType = torch.device("cpu")
     # TODO: Make the implementation compatible with CUDA?
-    BATCH_SIZE: int = 200
-    K: int = 4
-    decision_factor: int = 50
-
+    DEVICE: torch.DeviceObjType = torch.device("cpu")
+    
     TRAIN_DATA = None
     VAL_DATA = None
     TEST_DATA = None
@@ -25,11 +22,11 @@ class TCF(object):
     def __init__(
         self,
         dataset_name: str,
-        decay: float = 0.5,   # TODO: call it growth - will depend on the surprise rate of the dataset or the derived metric \sigma - technically, the lower the decay factor, the higher the surprise rate
+        decay: float = 0.9,   # TODO: call it growth - will depend on the surprise rate of the dataset or the derived metric \sigma - technically, the lower the decay factor, the higher the surprise rate
         device: torch.DeviceObjType = DEVICE,
-        batch_size: int = BATCH_SIZE,
-        k: int = K,
-        factor: int = decision_factor,
+        batch_size: int = 200,
+        k: int = 5,
+        factor: int = 0.5,
     ):
         self.decision_factor = factor
         self.K = k
@@ -47,8 +44,8 @@ class TCF(object):
         self.TRAIN_DATA, self.VAL_DATA, self.TEST_DATA = self._train_test_split(dataset)
 
         # create scipy lil matrix for the similarities between nodes
-        self.similarities = sp.sparse.lil_matrix((self.NUM_NODES, self.NUM_NODES))
-        self.sparse_bank = sp.sparse.lil_matrix((self.NUM_NODES, self.NUM_NODES))
+        self.similarities = sp.sparse.lil_matrix((self.NUM_SRC, self.NUM_DST))
+        self.sparse_bank = sp.sparse.lil_matrix((self.NUM_SRC, self.NUM_DST))
 
         self.bank = {}
 
@@ -80,39 +77,30 @@ class TCF(object):
         # assert train data is sorted by time
         assert (train_data.t == torch.sort(train_data.t).values).all(), "The train data is not sorted by time"
 
-        # save the min train time and the train time range
-        self.min_train_time: int = min(train_data.t)
-        self.train_time_range: int = max(train_data.t) - self.min_train_time
-
         val_data.src, val_data.dst, val_data.t = self._sort_graph_by_time(
             val_data.src, val_data.dst, val_data.t
         )
-
-        self.min_val_time = min(val_data.t)
-        self.val_time_range = max(val_data.t) - self.min_val_time
 
         test_data.src, test_data.dst, test_data.t = self._sort_graph_by_time(
             test_data.src, test_data.dst, test_data.t
         )
 
-        self.min_test_time = min(test_data.t)
-        self.test_time_range = max(test_data.t) - self.min_test_time
-        # sum up the time ranges
-        self.time_range = self.train_time_range + self.val_time_range + self.test_time_range
+        train_loader = TemporalDataLoader(train_data, batch_size=self.batch_size)
+        val_loader = TemporalDataLoader(val_data, batch_size=self.batch_size)
+        test_loader = TemporalDataLoader(test_data, batch_size=self.batch_size)
 
-        train_loader = TemporalDataLoader(train_data, batch_size=self.BATCH_SIZE)
-        val_loader = TemporalDataLoader(val_data, batch_size=self.BATCH_SIZE)
-        test_loader = TemporalDataLoader(test_data, batch_size=self.BATCH_SIZE)
-
-        # find the union of nodes in the train, val, and test sets
-        nodes = set()
-        nodes.update([a.item() for a in train_data.src])
-        nodes.update([a.item() for a in train_data.dst])
-        nodes.update([a.item() for a in val_data.src])
-        nodes.update([a.item() for a in val_data.dst])
-        nodes.update([a.item() for a in test_data.src])
-        nodes.update([a.item() for a in test_data.dst])
+        # find the union of source nodes in train, test, val and assign self.NUM_SRC and then destinations self.NUM_DST in all data
+        sources = set(train_data.src.tolist() + val_data.src.tolist() + test_data.src.tolist())
+        destinations = set(train_data.dst.tolist() + val_data.dst.tolist() + test_data.dst.tolist())
+        nodes = sources.union(destinations)
+        self.NUM_SRC = len(sources)
+        self.NUM_DST = len(destinations)
         self.NUM_NODES = len(nodes)
+
+        self.source_id_to_index = {source_id: index for index, source_id in enumerate(sorted(list(sources)))}
+        self.destination_id_to_index = {destination_id: index for index, destination_id in enumerate(sorted(list(destinations)))}
+        self.index_to_source_id = {index: source_id for source_id, index in self.source_id_to_index.items()}
+        self.index_to_destination_id = {index: destination_id for destination_id, index in self.destination_id_to_index.items()}
 
         return train_loader, val_loader, test_loader
 
@@ -150,101 +138,54 @@ class TCF(object):
 
         # iterate over each batch
         for batch in tqdm(self.TRAIN_DATA, desc="Training"):
-            # TODO: change the following to only entail train time
-            normalized_ts = (batch.t - self.min_train_time) / self.time_range
-            # calculate the recency factor for the current batch - between 1 and 2 (not inclusive)
-            recency_factor = np.finfo(float).eps + normalized_ts[0].item()
 
             for src, dst in zip(batch.src, batch.dst):
-                src_item = src.item()
-                dst_item = dst.item()
+                src_index = self.source_id_to_index[src.item()]
+                dst_index = self.destination_id_to_index[dst.item()]
 
                 # update the weight of the edge in the bank
-                old_weight = self.bank.get((src_item, dst_item), 0)
-                if self.DECAY > 1:
-                    new_weight = (1 + old_weight)
+                if self.sparse_bank[(src_index, dst_index)] == 0:
+                    self.bank[(src_index, dst_index)] = 1
+                    self.sparse_bank[(src_index, dst_index)] = 1
                 else:
-                    new_weight = (1 + old_weight) * (recency_factor / self.DECAY)
-                    self.sparse_bank[src_item, dst_item] = new_weight
-                self.bank[(src_item, dst_item)] = new_weight
+                    self.bank[(src_index, dst_index)] += 1
+                    self.sparse_bank[(src_index, dst_index)] += 1
+                    
+            # multiply the sparse bank by the self.DECAY factor
+            tmp = self.sparse_bank.tocsr()
+            self.sparse_bank = (tmp * self.DECAY).tolil()
 
-        mat = sp.sparse.csr_matrix(self.sparse_bank)
+        mat = self.sparse_bank.tocsr()
         mat_transpose = mat.transpose()
-        self.similarities = mat.multiply(mat_transpose).tolil()
+        self.similarities = (mat @ mat_transpose).tolil()
         return
-
-    def _get_most_similar_to(self, node: int, is_source: bool = True) -> np.ndarray:
-        """Get the K most similar nodes to the given node.
+    
+    def get_similars(self, source: int) -> np.ndarray:
+        """
+        Get the most similar nodes to the given source.
 
         Args:
-            node (int): the item associated with the candid node
-            is_source (bool): whether the given node is a source node
+            source (int): the source node
 
         Returns:
-            np.ndarray: list of the 20 most similar nodes
+            np.ndarray: the most similar nodes to the given source
         """
+        source_index = self.source_id_to_index[source]
 
-        # Initialize a dictionary to store the similarities for each candidate node
-        similarities = {}
+        # get the similarity scores for the given source - source is a row TODO: get non zero ones
+        similarity_scores = self.similarities[source_index].toarray()[0]
 
-        if is_source:
-            # Get the scores for the destinations seen by the given node
-            scores = {dst: value for (src, dst), value in self.bank.items() if src == node}
+        # get the indices of the nodes with non-zero similarity
+        non_zero_indices = np.nonzero(similarity_scores)[0]
 
-            # Add the node itself to the similarities dictionary with the dot product of its values with itself
-            similarities[node] = sum(value**2 for value in scores.values())
+        # sort the non-zero indices by their similarity scores in descending order
+        sorted_indices = non_zero_indices[np.argsort(similarity_scores[non_zero_indices])[::-1]]
 
-            # Get the unique source nodes in self.bank
-            unique_nodes = set(src for (src, _), _ in self.bank.items())
+        # get the first K indices, or all of them if there are less than K - these indices are not node ids, but indices in the sparse matrix
+        closest_to_source = sorted_indices[:min(self.K, len(sorted_indices))]
 
-            # Iterate over unique source nodes
-            for candid_node in unique_nodes:
-                if candid_node != node:  # Skip the node itself
-                    # Calculate the dot product of the scores for the given node and the candid node
-                    dot_product = sum(scores[dst] * self.bank.get((candid_node, dst), 0) for dst in scores if (candid_node, dst) in self.bank)
+        return closest_to_source
 
-                    # Store the dot product in the dictionary
-                    similarities[candid_node] = dot_product
-
-        # Get the 20 most similar nodes
-        most_similar = np.array(sorted(similarities, key=similarities.get, reverse=True)[:self.K])
-
-        return most_similar
-    
-
-    def predict(self, src: torch.Tensor, dst: torch.Tensor, ts: torch.Tensor) -> torch.Tensor:
-        """
-        Predict the probability of the given edges.
-
-        Args:
-            src (torch.Tensor): tensor containing the sources
-            dst (torch.Tensor): tensor containing the destinations
-            ts (torch.Tensor): tensor containing the timestamps
-
-        Returns:
-            torch.Tensor: tensor containing the probabilities
-        """
-        # sort the graph by time
-        sorted_src, sorted_dst, sorted_ts = self._sort_graph_by_time(src, dst, ts)
-
-        # initialize the probabilities
-        probs = torch.zeros(len(src))
-
-        # iterate over each edge
-        for i, (src_item, dst_item) in enumerate(zip(sorted_src, sorted_dst)):
-            # find the 20 most similar nodes to the given source
-            most_similar_nodes = self._get_most_similar_to(src_item.item())
-
-            # count the number of most similar nodes that have had a link to the destination
-            count = sum(1 for node in most_similar_nodes if (node, dst_item.item()) in self.bank)
-
-            # if more than 1/3 of the most similar nodes have had a link to the destination, predict as 1, otherwise predict as 0
-            # TODO: the threshold might be low - adjust based on surprise rate
-            if count > 100:
-                probs[i] = 1
-
-        return probs
-    
     def predict_given_sim(self, src: torch.Tensor, dst: torch.Tensor, ts: torch.Tensor, most_similars: np.ndarray) -> np.ndarray:
         """
         Predict the probability of the given edges.
@@ -258,19 +199,29 @@ class TCF(object):
         Returns:
             np.ndarray: tensor containing the probabilities
         """
-
         # initialize the probabilities
         probs = np.zeros(len(src))
 
         # iterate over each edge
+        # TODO: vectorize this
         for (i, dst_item) in enumerate(dst):
+            # get the links of the most similar nodes to the destination
+            destination = int(self.destination_id_to_index[dst_item.item()])
+
+            # TODO: get non zero ones only
+            if len(most_similars) == 1:
+                similars = most_similars[0]
+                links = np.array(self.sparse_bank[similars, destination])
+
+            else:
+                similars = most_similars
+                links = self.sparse_bank[similars, destination].toarray()
 
             # count the number of most similar nodes that have had a link to the destination
-            count = sum(1 for node in most_similars if (node, dst_item.item()) in self.bank)
+            count = np.count_nonzero(links)
 
             # if more than 1/3 of the most similar nodes have had a link to the destination, predict as 1, otherwise predict as 0
-            # TODO: the threshold might be low - adjust based on surprise rate
-            if count >= (len(most_similars) * (self.decision_factor / 100)):
+            if count >= (len(most_similars) * (self.decision_factor)):
                 probs[i] = 1
 
         return probs
@@ -299,26 +250,22 @@ class TCF(object):
         
         # iterate over each batch
         for pos_batch in tqdm(data, desc="Testing"):
-            # compute how much time an iteration takes
             pos_src, pos_dst, pos_t = pos_batch.src, pos_batch.dst, pos_batch.t
             neg_batch_list = self.negative_sampler.query_batch(pos_src, pos_dst, pos_t, split_mode=split_mode)
-            # counter = 0
+
 
             for idx, negative_candidates in tqdm(enumerate(neg_batch_list)):
                 source_id = int(pos_src[idx])
-                # closest_to_source = self._get_most_similar_to(source_id) 
                 # get the k highest similarity scores for the given source - source is a row
-                closest_to_source = np.array(np.array(self.similarities[source_id]).argsort()[-self.K:][::-1])
+
+                closest_to_source = self.get_similars(source_id)
 
                 query_src = torch.Tensor([int(pos_src[idx]) for _ in range(len(negative_candidates) + 1)])
                 query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates]))
                 query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(len(negative_candidates) + 1)])
 
-
-                # compute how much time getting the scores takes
-                start = time()
+                # compute the scores
                 scores = self.predict_given_sim(query_src, query_dst, query_ts, closest_to_source)
-                # print(f"getting the scores took {time() - start} seconds")
 
                 input_dict = {
                         "y_pred_pos": np.array([scores[0]]),
@@ -328,23 +275,25 @@ class TCF(object):
                     }
                 naive_mrr.append(evaluator.eval(input_dict)["mrr"])
 
-
-            normalized_ts = (pos_batch.t - self.min_train_time) / self.time_range
-            # calculate the recency factor for the current batch - between 1 and 2 (not inclusive)
-            recency_factor = np.finfo(float).eps + normalized_ts[0].item()
-
             for src, dst in zip(pos_batch.src, pos_batch.dst):
-                src_item = src.item()
-                dst_item = dst.item()
+                src_index = self.source_id_to_index[src.item()]
+                dst_index = self.destination_id_to_index[dst.item()]
 
                 # update the weight of the edge in the bank
-                old_weight = self.bank.get((src_item, dst_item), 0)
-                if self.DECAY > 1:
-                    new_weight = (1 + old_weight)
+                if self.sparse_bank[(src_index, dst_index)] == 0:
+                    self.bank[(src_index, dst_index)] = 1
+                    self.sparse_bank[(src_index, dst_index)] = 1
                 else:
-                    new_weight = (1 + old_weight) * (recency_factor / self.DECAY)
-                self.bank[(src_item, dst_item)] = new_weight
-
+                    self.bank[(src_index, dst_index)] += 1
+                    self.sparse_bank[(src_index, dst_index)] += 1
+            
+            start = time()
+            # multiply the sparse bank by the self.DECAY factor
+            mat = self.sparse_bank.tocsr()
+            mat_transpose = mat.transpose()
+            self.similarities = (mat @ mat_transpose).tolil()
+            self.sparse_bank = (mat * self.DECAY).tolil()
+            print(f"Time to update similarities bank: {time() - start}")
 
         naive_mrr = float(torch.tensor(naive_mrr).mean())
         print(f"Naive MRR: {naive_mrr}")
