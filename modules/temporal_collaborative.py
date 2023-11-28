@@ -1,10 +1,11 @@
+from time import time
 import torch
 from torch_geometric.loader import TemporalDataLoader
 from tqdm import tqdm
 from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
 import numpy as np
-from time import time
+import scipy as sp
 
 class TCF(object):
     r"""
@@ -36,7 +37,7 @@ class TCF(object):
         self.device = device
             
         self.DECAY: float = decay
-        self.batch_size = batch_size
+        self.batch_size = batch_size        
 
         # load the dataset
         dataset = PyGLinkPropPredDataset(name=dataset_name, root="data")
@@ -44,6 +45,10 @@ class TCF(object):
         self.dataset = dataset
 
         self.TRAIN_DATA, self.VAL_DATA, self.TEST_DATA = self._train_test_split(dataset)
+
+        # create scipy lil matrix for the similarities between nodes
+        self.similarities = sp.sparse.lil_matrix((self.NUM_NODES, self.NUM_NODES))
+        self.sparse_bank = sp.sparse.lil_matrix((self.NUM_NODES, self.NUM_NODES))
 
         self.bank = {}
 
@@ -145,7 +150,7 @@ class TCF(object):
 
         # iterate over each batch
         for batch in tqdm(self.TRAIN_DATA, desc="Training"):
-            # TODO: change the following to normalize from time 0 to the whole time range till the end of test
+            # TODO: change the following to only entail train time
             normalized_ts = (batch.t - self.min_train_time) / self.time_range
             # calculate the recency factor for the current batch - between 1 and 2 (not inclusive)
             recency_factor = np.finfo(float).eps + normalized_ts[0].item()
@@ -160,8 +165,12 @@ class TCF(object):
                     new_weight = (1 + old_weight)
                 else:
                     new_weight = (1 + old_weight) * (recency_factor / self.DECAY)
+                    self.sparse_bank[src_item, dst_item] = new_weight
                 self.bank[(src_item, dst_item)] = new_weight
 
+        mat = sp.sparse.csr_matrix(self.sparse_bank)
+        mat_transpose = mat.transpose()
+        self.similarities = mat.multiply(mat_transpose).tolil()
         return
 
     def _get_most_similar_to(self, node: int, is_source: bool = True) -> np.ndarray:
@@ -182,17 +191,20 @@ class TCF(object):
             # Get the scores for the destinations seen by the given node
             scores = {dst: value for (src, dst), value in self.bank.items() if src == node}
 
+            # Add the node itself to the similarities dictionary with the dot product of its values with itself
+            similarities[node] = sum(value**2 for value in scores.values())
+
             # Get the unique source nodes in self.bank
             unique_nodes = set(src for (src, _), _ in self.bank.items())
 
             # Iterate over unique source nodes
             for candid_node in unique_nodes:
+                if candid_node != node:  # Skip the node itself
+                    # Calculate the dot product of the scores for the given node and the candid node
+                    dot_product = sum(scores[dst] * self.bank.get((candid_node, dst), 0) for dst in scores if (candid_node, dst) in self.bank)
 
-                # Calculate the dot product of the scores for the given node and the candid node
-                dot_product = sum(scores[dst] * self.bank.get((candid_node, dst), 0) for dst in scores if (candid_node, dst) in self.bank)
-
-                # Store the dot product in the dictionary
-                similarities[candid_node] = dot_product
+                    # Store the dot product in the dictionary
+                    similarities[candid_node] = dot_product
 
         # Get the 20 most similar nodes
         most_similar = np.array(sorted(similarities, key=similarities.get, reverse=True)[:self.K])
@@ -293,28 +305,21 @@ class TCF(object):
             # counter = 0
 
             for idx, negative_candidates in tqdm(enumerate(neg_batch_list)):
-                # if counter > 50:
-                #     break
-                # counter += 1
-                # start = time()
                 source_id = int(pos_src[idx])
-                closest_to_source = self._get_most_similar_to(source_id) 
-                # print(f"getting the most similar nodes took {time() - start} seconds")
-                # start = time()
+                # closest_to_source = self._get_most_similar_to(source_id) 
+                # get the k highest similarity scores for the given source - source is a row
+                closest_to_source = np.array(np.array(self.similarities[source_id]).argsort()[-self.K:][::-1])
+
                 query_src = torch.Tensor([int(pos_src[idx]) for _ in range(len(negative_candidates) + 1)])
                 query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates]))
                 query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(len(negative_candidates) + 1)])
-                # print(f"creating the query took {time() - start} seconds")
 
-                # print(len(query_src), len(query_dst), len(query_ts))
+
                 # compute how much time getting the scores takes
-                # start = time()
+                start = time()
                 scores = self.predict_given_sim(query_src, query_dst, query_ts, closest_to_source)
                 # print(f"getting the scores took {time() - start} seconds")
-                # print(f"getting the scores took {time() - start} seconds")
-                # print("computed the scores for a batch")
-                # print(f"prediction score is {scores[0]}, and the wrong prediction score is {scores[1], scores[2]}")
-                # start = time()
+
                 input_dict = {
                         "y_pred_pos": np.array([scores[0]]),
                         "y_pred_neg": np.array(scores[1:]),
@@ -322,7 +327,7 @@ class TCF(object):
                         "eval_metric": ["mrr"],
                     }
                 naive_mrr.append(evaluator.eval(input_dict)["mrr"])
-                # print(f"evaluating the scores took {time() - start} seconds")
+
 
             normalized_ts = (pos_batch.t - self.min_train_time) / self.time_range
             # calculate the recency factor for the current batch - between 1 and 2 (not inclusive)
