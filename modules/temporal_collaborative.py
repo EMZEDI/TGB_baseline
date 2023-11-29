@@ -6,6 +6,8 @@ from tgb.linkproppred.dataset_pyg import PyGLinkPropPredDataset
 from tgb.linkproppred.evaluate import Evaluator
 import numpy as np
 import scipy as sp
+from scipy.sparse import coo_matrix
+import logging
 
 class TCF(object):
     r"""
@@ -22,12 +24,18 @@ class TCF(object):
     def __init__(
         self,
         dataset_name: str,
-        decay: float = 0.9,   # TODO: call it growth - will depend on the surprise rate of the dataset or the derived metric \sigma - technically, the lower the decay factor, the higher the surprise rate
+        decay: float = 0.9, 
         device: torch.DeviceObjType = DEVICE,
         batch_size: int = 200,
         k: int = 5,
         factor: int = 0.5,
     ):
+        self.logger = logging.getLogger(__name__)
+        # setup logging to file 
+        logging.basicConfig(filename=f"logs/{dataset_name}_tcf.log",
+                            filemode='w',
+                            format='%(asctime)s %(levelname)s:%(message)s',
+                            level=logging.DEBUG)
         self.decision_factor = factor
         self.K = k
         self.dataset_name = dataset_name
@@ -43,11 +51,15 @@ class TCF(object):
 
         self.TRAIN_DATA, self.VAL_DATA, self.TEST_DATA = self._train_test_split(dataset)
 
-        # create scipy lil matrix for the similarities between nodes
-        self.similarities = sp.sparse.lil_matrix((self.NUM_SRC, self.NUM_DST))
-        self.sparse_bank = sp.sparse.lil_matrix((self.NUM_SRC, self.NUM_DST))
+        # create scipy lil matrix for the similarities between nodes - use coo matrix 
+        self.bank_row = []
+        self.bank_col = []
+        self.bank_data = []
 
         self.bank = {}
+        self.sparse_bank = None
+        self.similarities = None
+
 
     def _train_test_split(
         self, dataset: PyGLinkPropPredDataset
@@ -89,19 +101,6 @@ class TCF(object):
         val_loader = TemporalDataLoader(val_data, batch_size=self.batch_size)
         test_loader = TemporalDataLoader(test_data, batch_size=self.batch_size)
 
-        # find the union of source nodes in train, test, val and assign self.NUM_SRC and then destinations self.NUM_DST in all data
-        sources = set(train_data.src.tolist() + val_data.src.tolist() + test_data.src.tolist())
-        destinations = set(train_data.dst.tolist() + val_data.dst.tolist() + test_data.dst.tolist())
-        nodes = sources.union(destinations)
-        self.NUM_SRC = len(sources)
-        self.NUM_DST = len(destinations)
-        self.NUM_NODES = len(nodes)
-
-        self.source_id_to_index = {source_id: index for index, source_id in enumerate(sorted(list(sources)))}
-        self.destination_id_to_index = {destination_id: index for index, destination_id in enumerate(sorted(list(destinations)))}
-        self.index_to_source_id = {index: source_id for source_id, index in self.source_id_to_index.items()}
-        self.index_to_destination_id = {index: destination_id for destination_id, index in self.destination_id_to_index.items()}
-
         return train_loader, val_loader, test_loader
 
     def _sort_graph_by_time(
@@ -132,34 +131,30 @@ class TCF(object):
         """
         Train the temporal collaborative filtering model.
         """
-        print(
-            f"Training the temporal collaborative filtering model for O({self.NUM_NODES}^2) edges."
-        )
 
         # iterate over each batch
         for batch in tqdm(self.TRAIN_DATA, desc="Training"):
 
             for src, dst in zip(batch.src, batch.dst):
-                src_index = self.source_id_to_index[src.item()]
-                dst_index = self.destination_id_to_index[dst.item()]
+                src_item = src.item()
+                dst_item = dst.item()
 
-                # update the weight of the edge in the bank
-                if self.sparse_bank[(src_index, dst_index)] == 0:
-                    self.bank[(src_index, dst_index)] = 1
-                    self.sparse_bank[(src_index, dst_index)] = 1
+                if (src_item, dst_item) not in self.bank:
+                    self.bank_row.append(src_item)
+                    self.bank_col.append(dst_item)
+                    self.bank_data.append(1)
+                    self.bank[(src_item, dst_item)] = len(self.bank_data) - 1
                 else:
-                    self.bank[(src_index, dst_index)] += 1
-                    self.sparse_bank[(src_index, dst_index)] += 1
+                    self.bank_data[self.bank[(src_item, dst_item)]] += 1
                     
-            # multiply the sparse bank by the self.DECAY factor
-            tmp = self.sparse_bank.tocsr()
-            self.sparse_bank = (tmp * self.DECAY).tolil()
+            self.bank_data = [self.DECAY * x for x in self.bank_data]
 
+        self.sparse_bank = coo_matrix((self.bank_data, (self.bank_row, self.bank_col)))
         mat = self.sparse_bank.tocsr()
         mat_transpose = mat.transpose()
         self.similarities = (mat @ mat_transpose).tolil()
         return
-    
+        
     def get_similars(self, source: int) -> np.ndarray:
         """
         Get the most similar nodes to the given source.
@@ -170,19 +165,30 @@ class TCF(object):
         Returns:
             np.ndarray: the most similar nodes to the given source
         """
-        source_index = self.source_id_to_index[source]
+        try:
 
-        # get the similarity scores for the given source - source is a row TODO: get non zero ones
-        similarity_scores = self.similarities[source_index].toarray()[0]
+            # get the column indices of the nodes with non-zero similarity
+            non_zero_indices = self.similarities[source].nonzero()[1]
 
-        # get the indices of the nodes with non-zero similarity
-        non_zero_indices = np.nonzero(similarity_scores)[0]
+            # get the non-zero similarity scores
+            non_zero_values = self.similarities[source].data
 
-        # sort the non-zero indices by their similarity scores in descending order
-        sorted_indices = non_zero_indices[np.argsort(similarity_scores[non_zero_indices])[::-1]]
+            # print(f"non_zero_indices: {non_zero_indices}")
+            # print(f"non_zero_values: {non_zero_values}")
 
-        # get the first K indices, or all of them if there are less than K - these indices are not node ids, but indices in the sparse matrix
-        closest_to_source = sorted_indices[:min(self.K, len(sorted_indices))]
+            # if non_zero_values is a scalar (only 1 neighbour), convert it back to a 1D array
+            if np.isscalar(non_zero_values):
+                non_zero_values = np.array([non_zero_values])
+
+            # sort the non-zero indices by their similarity scores in descending order
+            sorted_indices = non_zero_indices[np.argsort(non_zero_values[0])[::-1]]
+
+            # get the first K indices, or all of them if there are less than K
+            closest_to_source = sorted_indices[:min(self.K, len(sorted_indices))]
+
+        except IndexError:
+            # the given node is totally new - TODO: infer from the destination's popularity
+            closest_to_source = np.array([])
 
         return closest_to_source
 
@@ -199,30 +205,32 @@ class TCF(object):
         Returns:
             np.ndarray: tensor containing the probabilities
         """
-        # initialize the probabilities
-        probs = np.zeros(len(src))
+        bank = self.sparse_bank.tolil()
+        # convert the destination tensor to a numpy array
+        destination_indices = dst.numpy()
 
-        # iterate over each edge
-        # TODO: vectorize this
-        for (i, dst_item) in enumerate(dst):
-            # get the links of the most similar nodes to the destination
-            destination = int(self.destination_id_to_index[dst_item.item()])
+        # count the number of most similar nodes that have had a link to each destination
+        counts = np.zeros(len(destination_indices))
+        if len(most_similars) == 0:
+            # give 0.5 probability to all edges
+            return np.array([0.5] * len(destination_indices))
+        
+        # Iterate over the most similar nodes
+        for similar_node in most_similars:
+            # Get the destinations that the similar node has had a link with
+            _, linked_destinations = bank[similar_node, :].nonzero()
+            
+            # Check which destinations in destination_indices are in linked_destinations
+            is_destination_linked = np.in1d(destination_indices, linked_destinations)
+            
+            # Increment the count for the destinations that the similar node has had a link with
+            counts[is_destination_linked] += 1
 
-            # TODO: get non zero ones only
-            if len(most_similars) == 1:
-                similars = most_similars[0]
-                links = np.array(self.sparse_bank[similars, destination])
+        # Calculate the threshold for deciding whether to predict 1 or 0
+        threshold = len(most_similars) * self.decision_factor
 
-            else:
-                similars = most_similars
-                links = self.sparse_bank[similars, destination].toarray()
-
-            # count the number of most similar nodes that have had a link to the destination
-            count = np.count_nonzero(links)
-
-            # if more than 1/3 of the most similar nodes have had a link to the destination, predict as 1, otherwise predict as 0
-            if count >= (len(most_similars) * (self.decision_factor)):
-                probs[i] = 1
+        # Predict as 1 if the count for a destination is greater than or equal to the threshold, otherwise predict as 0
+        probs = (counts >= threshold).astype(np.float32)
 
         return probs
 
@@ -257,15 +265,21 @@ class TCF(object):
             for idx, negative_candidates in tqdm(enumerate(neg_batch_list)):
                 source_id = int(pos_src[idx])
                 # get the k highest similarity scores for the given source - source is a row
-
+                start = time()
+                # TODO: the most time consuming part of the code
                 closest_to_source = self.get_similars(source_id)
+                # log to file the time
+                # self.logger.debug(f"Time to get similars: {time() - start}")
 
                 query_src = torch.Tensor([int(pos_src[idx]) for _ in range(len(negative_candidates) + 1)])
                 query_dst = torch.Tensor(np.concatenate([np.array([int(pos_dst[idx])]), negative_candidates]))
                 query_ts = torch.Tensor([int(pos_t[idx]) for _ in range(len(negative_candidates) + 1)])
 
                 # compute the scores
+                start = time()
                 scores = self.predict_given_sim(query_src, query_dst, query_ts, closest_to_source)
+                # log to file the time
+                # self.logger.debug(f"Time to predict given sim: {time() - start}")
 
                 input_dict = {
                         "y_pred_pos": np.array([scores[0]]),
@@ -275,25 +289,31 @@ class TCF(object):
                     }
                 naive_mrr.append(evaluator.eval(input_dict)["mrr"])
 
+            start = time()
             for src, dst in zip(pos_batch.src, pos_batch.dst):
-                src_index = self.source_id_to_index[src.item()]
-                dst_index = self.destination_id_to_index[dst.item()]
+                src_item = src.item()
+                dst_item = dst.item()
 
-                # update the weight of the edge in the bank
-                if self.sparse_bank[(src_index, dst_index)] == 0:
-                    self.bank[(src_index, dst_index)] = 1
-                    self.sparse_bank[(src_index, dst_index)] = 1
+                if (src_item, dst_item) not in self.bank:
+                    self.bank_row.append(src_item)
+                    self.bank_col.append(dst_item)
+                    self.bank_data.append(1)
+                    self.bank[(src_item, dst_item)] = len(self.bank_data) - 1
                 else:
-                    self.bank[(src_index, dst_index)] += 1
-                    self.sparse_bank[(src_index, dst_index)] += 1
+                    self.bank_data[self.bank[(src_item, dst_item)]] += 1
+            # log to file the time
+            # self.logger.debug(f"Time to update bank: {time() - start}")
             
             start = time()
+            self.bank_data = [self.DECAY * x for x in self.bank_data]
+            
             # multiply the sparse bank by the self.DECAY factor
+            self.sparse_bank = coo_matrix((self.bank_data, (self.bank_row, self.bank_col)))
             mat = self.sparse_bank.tocsr()
             mat_transpose = mat.transpose()
             self.similarities = (mat @ mat_transpose).tolil()
-            self.sparse_bank = (mat * self.DECAY).tolil()
-            print(f"Time to update similarities bank: {time() - start}")
+            # log to file the time
+            # self.logger.debug(f"Time to update similarities: {time() - start}")
 
         naive_mrr = float(torch.tensor(naive_mrr).mean())
         print(f"Naive MRR: {naive_mrr}")
